@@ -9,12 +9,46 @@ export enum TargetPlatform {
   SHORTS = 'YouTube Shorts'
 }
 
+export enum MarketingGoal {
+  SALES = 'Direct Sales / Conversion',
+  TRAFFIC = 'Traffic Generation',
+  ENGAGEMENT = 'Viral Engagement',
+  AWARENESS = 'Brand Awareness'
+}
+
+export interface SocialAccount {
+  id: string;
+  platform: TargetPlatform;
+  username: string;
+  avatarUrl: string;
+  connected: boolean;
+  status: 'active' | 'expired';
+}
+
+export interface ScheduledPost {
+  id: string;
+  scriptTitle: string;
+  platform: TargetPlatform;
+  date: string;
+  time: string;
+  status: 'scheduled' | 'posted';
+}
+
+export interface ComplianceResult {
+  isSafe: boolean;
+  flaggedCategories: string[];
+  reason: string;
+  suggestion: string;
+}
+
 export interface VideoInputData {
   productName: string;
   description: string;
   targetAudience: string;
   duration: DurationOption;
   platform: TargetPlatform;
+  marketingGoal: MarketingGoal; // New
+  customKeywords: string; // New (SEO)
   url?: string;
 }
 
@@ -23,7 +57,7 @@ export interface Scene {
   duration: number; // in seconds
   narration: string;
   overlayText: string;
-  imageKeyword: string; // Used to fetch a relevant placeholder
+  imageKeyword: string; 
   seoKeywordUsed?: string;
   isCta?: boolean;
 }
@@ -33,8 +67,9 @@ export interface GeneratedScript {
   scenes: Scene[];
   seoKeywords: string[];
   hashtags: string[];
-  estimatedViralScore: number; // Simulated metric
+  estimatedViralScore: number;
   tone: string;
+  complianceCheck?: ComplianceResult; // New
 }
 
-export type AppState = 'input' | 'generating' | 'preview';
+export type AppState = 'input' | 'g
