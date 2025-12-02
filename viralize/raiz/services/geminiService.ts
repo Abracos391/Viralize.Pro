@@ -12,16 +12,8 @@ const parseJSON = (text: string) => {
     }
 };
 
-const getApiKey = () => {
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) {
-      throw new Error("API Key is missing. Please set REACT_APP_GEMINI_API_KEY or process.env.API_KEY");
-    }
-    return apiKey;
-}
-
 export const generateVideoScript = async (input: VideoInputData): Promise<GeneratedScript> => {
-  const ai = new GoogleGenAI({ apiKey: getApiKey() });
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   const numScenes = input.duration === DurationOption.SHORT ? 6 : 10;
   
@@ -95,12 +87,11 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 };
 
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
-    const apiKey = getApiKey();
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
-    // Aggressive Persistence Strategy
-    // We increase attempts to 5 and wait significantly longer on failures.
-    const MAX_RETRIES = 5;
+    // EXTREME PERSISTENCE STRATEGY
+    // We increase attempts to 10 to virtually guarantee success even with 1-min lockouts
+    const MAX_RETRIES = 10;
     
     let lastError;
 
@@ -134,12 +125,12 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             // If it's the last attempt, fail.
             if (attempt === MAX_RETRIES) break;
 
-            // BACKOFF STRATEGY
-            // If rate limited, wait 6-10 seconds. If generic error, wait 2-4 seconds.
-            const waitTime = isRateLimit ? 6000 + (Math.random() * 4000) : 2000 * attempt;
+            // EXTREME BACKOFF STRATEGY
+            // If rate limited, wait 15-20 seconds. This is necessary for Free Tier.
+            const waitTime = isRateLimit ? 15000 + (Math.random() * 5000) : 3000 * attempt;
             
             if (onRetry) {
-                onRetry(isRateLimit ? `Rate limit hit. Cooling down ${Math.round(waitTime/1000)}s...` : `Retrying audio (${attempt})...`);
+                onRetry(isRateLimit ? `Rate limit (429). Cooling down ${Math.round(waitTime/1000)}s...` : `Retrying audio (${attempt})...`);
             }
 
             await new Promise(resolve => setTimeout(resolve, waitTime));
