@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, Music4, AlertTriangle } from 'lucide-react';
-import { generateNarration } from '../services/geminiService';
+import { generateNarration, getStockImage } from '../services/geminiService';
 
 interface VideoPlayerProps {
   script: GeneratedScript;
@@ -96,28 +96,35 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     
     const loadAssets = async () => {
         try {
-            setLoadingStatus("Checking Cache...");
+            setLoadingStatus("Preparing visuals...");
             
-            // Load Images
-            const imagePromises = script.scenes.map((scene) => {
-                return new Promise<void>((resolve) => {
+            // Load Images (Stock or Placeholder)
+            // We load them sequentially to not hammer the API limits if any
+            for (let i = 0; i < script.scenes.length; i++) {
+                 const scene = script.scenes[i];
+                 setLoadingStatus(`Loading Visuals ${i+1}/${script.scenes.length}...`);
+                 
+                 const imageUrl = await getStockImage(scene.imageKeyword);
+                 
+                 await new Promise<void>((resolve) => {
                     const img = new Image();
-                    img.crossOrigin = "Anonymous";
-                    img.src = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
+                    img.crossOrigin = "Anonymous"; // CRITICAL for Canvas recording
+                    img.src = imageUrl;
                     img.onload = () => {
                         imageCache.current[scene.id] = img;
                         resolve();
                     };
                     img.onerror = () => {
-                        console.error(`Failed img: ${scene.id}`);
-                        resolve(); 
+                        console.error(`Failed img: ${scene.id}, trying fallback`);
+                        // Last ditch fallback
+                        img.src = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
+                        // Resolve anyway to not block app
+                        setTimeout(resolve, 1000); 
                     };
-                });
-            });
+                 });
+            }
 
             // Load Audio Sequentially with "NO FAIL" Policy + Local Caching
-            // We do not skip scene if it fails. We try forever.
-            // 4.5s delay if not cached to stay under 15 RPM.
             const MIN_INTERVAL = 4500; 
 
             for (let i = 0; i < script.scenes.length; i++) {
@@ -125,47 +132,35 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 let success = false;
                 
                 while (!success) {
-                    setLoadingStatus(`Loading Audio ${i + 1}/${script.scenes.length}...`);
+                    setLoadingStatus(`Synthesizing Audio ${i + 1}/${script.scenes.length}...`);
                     
                     try {
-                        // The service handles caching. If cached, it returns immediately.
-                        // If not, we might need a delay to avoid rate limits if we are looping fast.
-                        // But since we don't know if it's cached until we call it, we rely on the service to be fast.
-                        // However, to be safe against rate limits on NEW content:
-                        
                         const startT = Date.now();
                         const base64Audio = await generateNarration(scene.narration, (msg) => {
                             setLoadingStatus(`${msg} (Scene ${i+1})`); 
                         });
                         const dur = Date.now() - startT;
 
-                        // If it was super fast (<100ms), it was cached. No delay needed.
-                        // If it took longer, it was an API call. We should wait before the next one.
                         if (dur > 100 && i < script.scenes.length - 1) {
-                             // Enforce safety delay for next iteration
-                             setLoadingStatus(`Cooling down API (Safety delay)...`);
+                             setLoadingStatus(`Optimizing API quota...`);
                              await new Promise(r => setTimeout(r, 2000));
                         }
 
                         if (audioCtxRef.current && base64Audio) {
                             const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
                             audioBufferCache.current[scene.id] = buffer;
-                            success = true; // Exit while loop only on success
+                            success = true; 
                         } else {
                             throw new Error("Empty audio received");
                         }
                     } catch (e) {
                         console.error(`Audio fail for scene ${scene.id}. Retrying indefinitely...`, e);
-                        setLoadingStatus(`Network glitch on Scene ${i+1}. Retrying in 5s...`);
+                        setLoadingStatus(`Waiting for Google API (Scene ${i+1})...`);
                         await new Promise(r => setTimeout(r, 5000));
-                        // success remains false, loop continues
                     }
                 }
             }
 
-            setLoadingStatus("Finalizing visuals...");
-            await Promise.all(imagePromises);
-            
             setAssetsLoaded(true);
             setLoadingStatus("Ready");
             drawFrame(0, 0); 
@@ -546,7 +541,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           <div className="flex justify-between items-start mb-4">
             <div>
               <h3 className="text-2xl font-bold text-white mb-1">{script.title}</h3>
-              <p className="text-xs text-gray-400">Audio Cache Active (Faster Reloads)</p>
+              <p className="text-xs text-gray-400">
+                  {process.env.PEXELS_API_KEY ? "Stock Images Active (Pexels)" : "Standard Mode (Basic Images)"}
+              </p>
             </div>
             <div className="bg-gray-900 rounded-lg px-3 py-1 border border-brand-500/30">
               <span className="text-xs text-gray-400 uppercase">Viral Score</span>
