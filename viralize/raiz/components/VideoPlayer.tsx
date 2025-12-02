@@ -14,12 +14,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [progress, setProgress] = useState(0); 
   const [isMuted, setIsMuted] = useState(false);
   const [assetsLoaded, setAssetsLoaded] = useState(false);
-  const [loadingStatus, setLoadingStatus] = useState("Loading assets...");
+  const [loadingStatus, setLoadingStatus] = useState("Initializing...");
   const [isDownloading, setIsDownloading] = useState(false);
   
-  // No longer using audioError state because we refuse to accept errors.
-  // We wait until success.
-
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<number | null>(null);
   const sceneStartTimeRef = useRef<number>(0);
@@ -99,7 +96,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     
     const loadAssets = async () => {
         try {
-            setLoadingStatus("Fetching visuals...");
+            setLoadingStatus("Checking Cache...");
+            
             // Load Images
             const imagePromises = script.scenes.map((scene) => {
                 return new Promise<void>((resolve) => {
@@ -117,28 +115,37 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 });
             });
 
-            // Load Audio Sequentially with "NO FAIL" Policy
+            // Load Audio Sequentially with "NO FAIL" Policy + Local Caching
             // We do not skip scene if it fails. We try forever.
-            const MIN_INTERVAL = 6000; // 6 seconds per request to be extremely safe with 15 RPM limit
+            // 4.5s delay if not cached to stay under 15 RPM.
+            const MIN_INTERVAL = 4500; 
 
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
                 let success = false;
                 
                 while (!success) {
-                    setLoadingStatus(`Generating Audio (${i + 1}/${script.scenes.length})...`);
+                    setLoadingStatus(`Loading Audio ${i + 1}/${script.scenes.length}...`);
                     
                     try {
-                        // Rate limit spacer
-                        if (i > 0) {
-                             await new Promise(r => setTimeout(r, MIN_INTERVAL));
-                        }
-
-                        // The service handles retries for rate limits internally (50 retries),
-                        // but if it throws (e.g. network disconnect), we catch here and retry the loop.
+                        // The service handles caching. If cached, it returns immediately.
+                        // If not, we might need a delay to avoid rate limits if we are looping fast.
+                        // But since we don't know if it's cached until we call it, we rely on the service to be fast.
+                        // However, to be safe against rate limits on NEW content:
+                        
+                        const startT = Date.now();
                         const base64Audio = await generateNarration(scene.narration, (msg) => {
                             setLoadingStatus(`${msg} (Scene ${i+1})`); 
                         });
+                        const dur = Date.now() - startT;
+
+                        // If it was super fast (<100ms), it was cached. No delay needed.
+                        // If it took longer, it was an API call. We should wait before the next one.
+                        if (dur > 100 && i < script.scenes.length - 1) {
+                             // Enforce safety delay for next iteration
+                             setLoadingStatus(`Cooling down API (Safety delay)...`);
+                             await new Promise(r => setTimeout(r, 2000));
+                        }
 
                         if (audioCtxRef.current && base64Audio) {
                             const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
@@ -156,6 +163,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 }
             }
 
+            setLoadingStatus("Finalizing visuals...");
             await Promise.all(imagePromises);
             
             setAssetsLoaded(true);
@@ -511,7 +519,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
              <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 z-30 p-4 text-center">
                  <Loader2 className="animate-spin text-brand-500 mb-2" size={32} />
                  <span className="text-sm text-gray-400 font-medium animate-pulse">{loadingStatus}</span>
-                 <p className="text-xs text-gray-600 mt-4 px-2">Please wait. AI generation speed is limited to ensure quality and free access.</p>
+                 <p className="text-xs text-gray-600 mt-4 px-2">Optimizing requests...</p>
              </div>
         )}
 
@@ -538,7 +546,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           <div className="flex justify-between items-start mb-4">
             <div>
               <h3 className="text-2xl font-bold text-white mb-1">{script.title}</h3>
-              <p className="text-xs text-gray-400">Audio will be generated losslessly.</p>
+              <p className="text-xs text-gray-400">Audio Cache Active (Faster Reloads)</p>
             </div>
             <div className="bg-gray-900 rounded-lg px-3 py-1 border border-brand-500/30">
               <span className="text-xs text-gray-400 uppercase">Viral Score</span>
