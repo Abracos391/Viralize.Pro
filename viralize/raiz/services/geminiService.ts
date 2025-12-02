@@ -1,6 +1,36 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption } from "../types";
 
+// Simple string hash for cache keys
+const hashCode = (s: string) => {
+    let h = 0, l = s.length, i = 0;
+    if ( l > 0 )
+      while (i < l)
+        h = (h << 5) - h + s.charCodeAt(i++) | 0;
+    return h;
+};
+
+const getCachedAudio = (text: string): string | null => {
+    try {
+        const key = `tts_cache_${hashCode(text)}`;
+        const cached = localStorage.getItem(key);
+        if (cached) return cached;
+    } catch (e) {
+        console.warn("Cache retrieval failed", e);
+    }
+    return null;
+};
+
+const setCachedAudio = (text: string, data: string) => {
+    try {
+        const key = `tts_cache_${hashCode(text)}`;
+        localStorage.setItem(key, data);
+    } catch (e) {
+        // LocalStorage might be full, ignore
+        console.warn("Cache storage failed", e);
+    }
+};
+
 const parseJSON = (text: string) => {
     try {
         // Remove markdown code blocks if present
@@ -87,6 +117,13 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 };
 
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
+    // 1. Check Cache first
+    const cached = getCachedAudio(text);
+    if (cached) {
+        if (onRetry) onRetry("Loaded from cache");
+        return cached;
+    }
+
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
     // EXTREME PERSISTENCE STRATEGY (V2 - "Never Give Up")
@@ -112,7 +149,11 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             });
 
             const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-            if (audioData) return audioData;
+            if (audioData) {
+                // Save to cache
+                setCachedAudio(text, audioData);
+                return audioData;
+            }
             
             throw new Error("API returned empty audio data");
 
@@ -132,7 +173,7 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             
             if (onRetry) {
                 const timeLeft = Math.round(waitTime/1000);
-                onRetry(isRateLimit ? `API Busy (Rate Limit). Waiting ${timeLeft}s to clear quota...` : `Connection glitch. Retrying (${attempt}/${MAX_RETRIES})...`);
+                onRetry(isRateLimit ? `API Limit (Free Tier). Cooldown: ${timeLeft}s...` : `Retrying connection (${attempt}/${MAX_RETRIES})...`);
             }
 
             await new Promise(resolve => setTimeout(resolve, waitTime));
