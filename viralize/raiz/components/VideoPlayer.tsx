@@ -16,7 +16,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [assetsLoaded, setAssetsLoaded] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("Loading assets...");
   const [isDownloading, setIsDownloading] = useState(false);
-  const [audioError, setAudioError] = useState(false);
+  
+  // No longer using audioError state because we refuse to accept errors.
+  // We wait until success.
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<number | null>(null);
@@ -92,7 +94,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   useEffect(() => {
     setAssetsLoaded(false);
     setIsPlaying(false);
-    setAudioError(false);
     imageCache.current = {};
     audioBufferCache.current = {};
     
@@ -116,35 +117,42 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 });
             });
 
-            // Load Audio Sequentially with "Strict Throttling"
-            // Gemini Free Tier = 15 RPM (Requests Per Minute).
-            // That means we can strictly only do 1 request every 4 seconds (60/15).
-            // We set it to 4.5s to be safe.
-            const MIN_INTERVAL = 4500; 
+            // Load Audio Sequentially with "NO FAIL" Policy
+            // We do not skip scene if it fails. We try forever.
+            const MIN_INTERVAL = 6000; // 6 seconds per request to be extremely safe with 15 RPM limit
 
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
-                setLoadingStatus(`Generating Audio (${i + 1}/${script.scenes.length})...`);
+                let success = false;
                 
-                try {
-                    // Force wait to respect API limits
-                    if (i > 0) {
-                        await new Promise(r => setTimeout(r, MIN_INTERVAL));
-                    }
+                while (!success) {
+                    setLoadingStatus(`Generating Audio (${i + 1}/${script.scenes.length})...`);
+                    
+                    try {
+                        // Rate limit spacer
+                        if (i > 0) {
+                             await new Promise(r => setTimeout(r, MIN_INTERVAL));
+                        }
 
-                    const base64Audio = await generateNarration(scene.narration, (msg) => {
-                        setLoadingStatus(`${msg}`); // Show retry status to user
-                    });
+                        // The service handles retries for rate limits internally (50 retries),
+                        // but if it throws (e.g. network disconnect), we catch here and retry the loop.
+                        const base64Audio = await generateNarration(scene.narration, (msg) => {
+                            setLoadingStatus(`${msg} (Scene ${i+1})`); 
+                        });
 
-                    if (audioCtxRef.current && base64Audio) {
-                        const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
-                        audioBufferCache.current[scene.id] = buffer;
-                    } else {
-                        throw new Error("Empty audio");
+                        if (audioCtxRef.current && base64Audio) {
+                            const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
+                            audioBufferCache.current[scene.id] = buffer;
+                            success = true; // Exit while loop only on success
+                        } else {
+                            throw new Error("Empty audio received");
+                        }
+                    } catch (e) {
+                        console.error(`Audio fail for scene ${scene.id}. Retrying indefinitely...`, e);
+                        setLoadingStatus(`Network glitch on Scene ${i+1}. Retrying in 5s...`);
+                        await new Promise(r => setTimeout(r, 5000));
+                        // success remains false, loop continues
                     }
-                } catch (e) {
-                    console.error("Audio fail for scene " + scene.id, e);
-                    setAudioError(true);
                 }
             }
 
@@ -156,7 +164,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
         } catch (e) {
             console.error(e);
-            setLoadingStatus("Error loading assets");
+            setLoadingStatus("Critical Error: Please refresh");
         }
     };
 
@@ -503,6 +511,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
              <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 z-30 p-4 text-center">
                  <Loader2 className="animate-spin text-brand-500 mb-2" size={32} />
                  <span className="text-sm text-gray-400 font-medium animate-pulse">{loadingStatus}</span>
+                 <p className="text-xs text-gray-600 mt-4 px-2">Please wait. AI generation speed is limited to ensure quality and free access.</p>
              </div>
         )}
 
@@ -513,13 +522,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                     REC
                 </div>
             </div>
-        )}
-
-        {/* Audio Error Overlay - Critical Failure Only */}
-        {audioError && !isDownloading && (
-             <div className="absolute top-4 right-4 z-30 bg-red-500 text-white text-xs px-2 py-1 rounded shadow-lg">
-                 Partial Audio
-             </div>
         )}
 
         <canvas 
@@ -536,7 +538,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           <div className="flex justify-between items-start mb-4">
             <div>
               <h3 className="text-2xl font-bold text-white mb-1">{script.title}</h3>
-              {audioError && <p className="text-xs text-red-400 flex items-center gap-1">Some clips failed even after retries.</p>}
+              <p className="text-xs text-gray-400">Audio will be generated losslessly.</p>
             </div>
             <div className="bg-gray-900 rounded-lg px-3 py-1 border border-brand-500/30">
               <span className="text-xs text-gray-400 uppercase">Viral Score</span>
