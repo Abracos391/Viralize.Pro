@@ -89,9 +89,10 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
-    // EXTREME PERSISTENCE STRATEGY
-    // We increase attempts to 10 to virtually guarantee success even with 1-min lockouts
-    const MAX_RETRIES = 10;
+    // EXTREME PERSISTENCE STRATEGY (V2 - "Never Give Up")
+    // Free tier limits are strictly enforced. We must wait them out.
+    // 50 retries with 30s wait = 25 minutes of patience.
+    const MAX_RETRIES = 50;
     
     let lastError;
 
@@ -126,11 +127,12 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             if (attempt === MAX_RETRIES) break;
 
             // EXTREME BACKOFF STRATEGY
-            // If rate limited, wait 15-20 seconds. This is necessary for Free Tier.
-            const waitTime = isRateLimit ? 15000 + (Math.random() * 5000) : 3000 * attempt;
+            // If rate limited, wait 30 seconds FULL. This clears the 15 RPM window.
+            const waitTime = isRateLimit ? 30000 : 5000 + (attempt * 1000);
             
             if (onRetry) {
-                onRetry(isRateLimit ? `Rate limit (429). Cooling down ${Math.round(waitTime/1000)}s...` : `Retrying audio (${attempt})...`);
+                const timeLeft = Math.round(waitTime/1000);
+                onRetry(isRateLimit ? `API Busy (Rate Limit). Waiting ${timeLeft}s to clear quota...` : `Connection glitch. Retrying (${attempt}/${MAX_RETRIES})...`);
             }
 
             await new Promise(resolve => setTimeout(resolve, waitTime));
