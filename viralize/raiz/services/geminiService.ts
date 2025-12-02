@@ -42,6 +42,38 @@ const parseJSON = (text: string) => {
     }
 };
 
+// --- STOCK MEDIA SERVICE ---
+export const getStockImage = async (keyword: string): Promise<string> => {
+    const pexelsKey = process.env.PEXELS_API_KEY;
+    
+    // Fallback URL (Picsum)
+    const fallbackUrl = `https://picsum.photos/seed/${keyword}/1080/1920`;
+
+    if (!pexelsKey || pexelsKey.length < 10) {
+        console.log("No Pexels Key found, using placeholder.");
+        return fallbackUrl;
+    }
+
+    try {
+        const response = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(keyword)}&per_page=1&orientation=portrait`, {
+            headers: {
+                Authorization: pexelsKey
+            }
+        });
+
+        if (!response.ok) throw new Error("Pexels API Error");
+
+        const data = await response.json();
+        if (data.photos && data.photos.length > 0) {
+            return data.photos[0].src.portrait;
+        }
+    } catch (e) {
+        console.warn("Failed to fetch stock image, using fallback", e);
+    }
+
+    return fallbackUrl;
+};
+
 export const generateVideoScript = async (input: VideoInputData): Promise<GeneratedScript> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -71,7 +103,7 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
     1. Return valid JSON only.
     2. "scenes" array must have exactly ${numScenes} items.
     3. "duration" for scenes must sum up to approx ${input.duration === DurationOption.SHORT ? 15 : 30}.
-    4. "imageKeyword" must be a single English word to search for a stock photo (e.g., "fitness", "gym", "happy").
+    4. "imageKeyword" must be a single, broad English word suitable for searching a stock photo library (e.g., use "gym" instead of "man lifting heavy weights", use "office" instead of "corporate meeting room").
     5. Scene 1 is the HOOK (1.5s-2.5s).
     6. The last scene is the CTA (3.5s-4.5s).
 
