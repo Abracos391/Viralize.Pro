@@ -89,8 +89,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       return await ctx.decodeAudioData(bytes.buffer);
   };
 
-  // We removed createSilentBuffer. If it fails, we show an error, but we try HARD not to fail.
-
   useEffect(() => {
     setAssetsLoaded(false);
     setIsPlaying(false);
@@ -118,16 +116,20 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 });
             });
 
-            // Load Audio Sequentially with "Smart Persistence"
+            // Load Audio Sequentially with "Strict Throttling"
+            // Gemini Free Tier = 15 RPM (Requests Per Minute).
+            // That means we can strictly only do 1 request every 4 seconds (60/15).
+            // We set it to 4.5s to be safe.
+            const MIN_INTERVAL = 4500; 
+
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
                 setLoadingStatus(`Generating Audio (${i + 1}/${script.scenes.length})...`);
                 
                 try {
-                    // Safe buffer delay to avoid hitting limits immediately on scene 2
+                    // Force wait to respect API limits
                     if (i > 0) {
-                        const safetyDelay = 2500; // 2.5s base delay between scenes
-                        await new Promise(r => setTimeout(r, safetyDelay));
+                        await new Promise(r => setTimeout(r, MIN_INTERVAL));
                     }
 
                     const base64Audio = await generateNarration(scene.narration, (msg) => {
@@ -143,8 +145,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 } catch (e) {
                     console.error("Audio fail for scene " + scene.id, e);
                     setAudioError(true);
-                    // If after 5 retries it still fails, we sadly have to skip it or it crashes.
-                    // But with the new service logic, this should be extremely rare.
                 }
             }
 
