@@ -154,9 +154,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   const playSceneAudio = (sceneIndex: number) => {
     if (!audioCtxRef.current || !masterGainRef.current) return;
+    // Don't stop audio here abruptly if we are transitioning seamlessly
+    // But for simplicity in this loop, we stop previous.
     stopAudio(); 
+    
     const sceneId = script.scenes[sceneIndex].id;
     const buffer = audioBufferCache.current[sceneId];
+    
     if (buffer) {
         const source = audioCtxRef.current.createBufferSource();
         source.buffer = buffer;
@@ -166,15 +170,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     }
   };
 
-  const startPlayback = (recordingMode = false) => {
+  const startPlayback = async (recordingMode = false) => {
       // Reset
       setCurrentSceneIndex(0);
       setProgress(0);
       sceneStartTimeRef.current = Date.now();
       
-      // Ensure Audio Context is running (user interaction req)
+      // FORCE AUDIO RESUME (Critical for download)
       if (audioCtxRef.current?.state === 'suspended') {
-          audioCtxRef.current.resume();
+          await audioCtxRef.current.resume();
       }
 
       setIsPlaying(true);
@@ -210,7 +214,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             } else {
                 // Video Finished
                 if (recordingMode) {
-                    finishRecording();
+                    // Give a small buffer for last audio to finish
+                    setTimeout(() => finishRecording(), 500);
                 } else {
                     setIsPlaying(false);
                     stopAudio();
@@ -243,14 +248,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
     // Draw Image (Zoom Effect)
     if (img) {
-      const scale = 1 + (sceneProgressPercent / 100) * 0.10; 
-      const scaledWidth = canvas.width * scale;
-      const scaledHeight = canvas.height * scale;
-      const x = (canvas.width - scaledWidth) / 2;
-      const y = (canvas.height - scaledHeight) / 2;
-      ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
+      try {
+          const scale = 1 + (sceneProgressPercent / 100) * 0.10; 
+          const scaledWidth = canvas.width * scale;
+          const scaledHeight = canvas.height * scale;
+          const x = (canvas.width - scaledWidth) / 2;
+          const y = (canvas.height - scaledHeight) / 2;
+          ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
+      } catch (e) {
+          // Prevent Tainted Canvas crash if image is weird
+          console.warn("Draw error", e);
+      }
     } else {
-        // Fallback Gradient if image missing
+        // Fallback Gradient
         const grd = ctx.createLinearGradient(0, 0, 0, canvas.height);
         grd.addColorStop(0, "#1e3a8a");
         grd.addColorStop(1, "#000000");
@@ -340,61 +350,88 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   // --- RECORDING ---
   const handleDownload = async () => {
       if (!canvasRef.current || !destNodeRef.current || !audioCtxRef.current) {
-          alert("Browser not supported.");
+          alert("Browser environment not supported (Missing Canvas or AudioContext).");
           return;
       }
 
-      // 1. Prepare
-      stopAudio();
-      setIsProcessing(true); // UI Lock
+      try {
+          // 1. Prepare
+          stopAudio();
+          setIsProcessing(true); // UI Lock
 
-      // 2. Setup Stream (Canvas + Audio)
-      const canvasStream = canvasRef.current.captureStream(30); // 30 FPS
-      const audioStream = destNodeRef.current.stream;
-      const combinedStream = new MediaStream([
-          ...canvasStream.getVideoTracks(),
-          ...audioStream.getAudioTracks()
-      ]);
-
-      // 3. Setup Recorder
-      // Try high quality codecs if available
-      let options = { mimeType: 'video/webm' };
-      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) {
-          options = { mimeType: 'video/webm;codecs=vp9,opus' };
-      } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) {
-          options = { mimeType: 'video/webm;codecs=vp8,opus' };
-      }
-
-      const recorder = new MediaRecorder(combinedStream, options);
-
-      recordedChunksRef.current = [];
-      recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = () => {
-          // Create File
-          const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-          const url = URL.createObjectURL(blob);
+          // 2. Setup Stream (Canvas + Audio)
+          // Ensure we are capturing at a standard frame rate
+          const canvasStream = canvasRef.current.captureStream(30); 
+          const audioStream = destNodeRef.current.stream;
           
-          // Trigger Download
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `${script.title.replace(/\s+/g, '_')}_ViralizePro.webm`;
-          document.body.appendChild(a);
-          a.click();
-          window.URL.revokeObjectURL(url);
+          if (audioStream.getAudioTracks().length === 0) {
+              console.warn("No audio tracks found in destination node");
+          }
+
+          const combinedStream = new MediaStream([
+              ...canvasStream.getVideoTracks(),
+              ...audioStream.getAudioTracks()
+          ]);
+
+          // 3. Setup Recorder - USE DEFAULT BROWSER CODEC to avoid "Not Supported" error
+          // Do NOT force 'vp9' or 'opus' as it crashes on some Safaris/Windows
+          const recorder = new MediaRecorder(combinedStream);
+
+          recordedChunksRef.current = [];
+          recorder.ondataavailable = (e) => {
+              if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+          };
+
+          recorder.onerror = (e: any) => {
+              console.error("Recorder Error:", e);
+              alert(`Recording Failed: ${e.error?.message || "Unknown Error"}`);
+              setIsProcessing(false);
+              setIsPlaying(false);
+          };
+
+          recorder.onstop = () => {
+              try {
+                // Create File
+                const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+                
+                if (blob.size < 1000) {
+                    alert("Recording failed: Output file is empty. Check console.");
+                    return;
+                }
+
+                const url = URL.createObjectURL(blob);
+                
+                // Trigger Download
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${script.title.replace(/\s+/g, '_')}_ViralizePro.webm`;
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+              } catch (e: any) {
+                  alert("Failed to save video file: " + e.message);
+              } finally {
+                  setIsProcessing(false);
+                  setIsPlaying(false);
+              }
+          };
+
+          mediaRecorderRef.current = recorder;
+
+          // 4. Start Everything
+          // Must resume audio context specifically for recording context
+          if (audioCtxRef.current.state === 'suspended') {
+              await audioCtxRef.current.resume();
+          }
           
-          // Cleanup
+          recorder.start();
+          startPlayback(true); // Start animation loop in recording mode
+      } catch (e: any) {
+          alert("Critical Recording Error: " + e.message);
+          console.error(e);
           setIsProcessing(false);
           setIsPlaying(false);
-      };
-
-      mediaRecorderRef.current = recorder;
-
-      // 4. Start Everything
-      recorder.start();
-      startPlayback(true); // Start animation loop in recording mode
+      }
   };
 
   const finishRecording = () => {
