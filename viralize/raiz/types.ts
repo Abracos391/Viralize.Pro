@@ -47,17 +47,17 @@ export interface VideoInputData {
   targetAudience: string;
   duration: DurationOption;
   platform: TargetPlatform;
-  marketingGoal: MarketingGoal; // New
-  customKeywords: string; // New (SEO)
+  marketingGoal: MarketingGoal;
+  customKeywords: string;
   url?: string;
 }
 
 export interface Scene {
   id: number;
-  duration: number; // in seconds
+  duration: number;
   narration: string;
   overlayText: string;
-  imageKeyword: string; 
+  imageKeyword: string;
   seoKeywordUsed?: string;
   isCta?: boolean;
 }
@@ -69,7 +69,7 @@ export interface GeneratedScript {
   hashtags: string[];
   estimatedViralScore: number;
   tone: string;
-  complianceCheck?: ComplianceResult; // New
+  complianceCheck?: ComplianceResult;
 }
 
-export type AppState = 'input' | 'g
+export type AppState = 'input' | 'generating' | 'preview' | 'accounts' | 'schedule' | 'analytics';
