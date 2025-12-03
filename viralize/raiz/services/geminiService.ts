@@ -2,29 +2,33 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, MarketingGoal } from "../types";
 
 // --- API KEY MANAGER ---
-// USER PROVIDED KEY - SET AS PRIORITY FALLBACK
+// USER PROVIDED KEY INJECTED FOR IMMEDIATE FIX
 const EMERGENCY_KEY = "AIzaSyBSEELLWDIa01iwsXLlGtNHg283oqSu65g";
 
 export const getApiKey = (): string => {
     let candidateKey = "";
 
-    // 1. Check Browser Storage (Runtime) - User entered in Modal
+    // 1. Check Environment Variable (Build time / Render)
+    const envKey = process.env.API_KEY;
+    if (envKey && envKey.length > 10 && envKey !== 'undefined') {
+        candidateKey = envKey;
+    }
+    
+    // 2. Check Browser Storage (Runtime) - Overrides Env if present
     if (typeof window !== 'undefined') {
         const localKey = localStorage.getItem('GEMINI_API_KEY');
-        if (localKey && localKey.length > 10 && localKey.startsWith("AIza")) {
-            return localKey;
+        if (localKey && localKey.length > 10) {
+            candidateKey = localKey;
         }
     }
 
-    // 2. Check Environment Variable
-    const envKey = process.env.API_KEY;
-    if (envKey && envKey.length > 10 && envKey.startsWith("AIza")) {
-        candidateKey = envKey;
+    // 3. VALIDATION: Google Keys MUST start with "AIza"
+    if (candidateKey && candidateKey.startsWith("AIza")) {
         return candidateKey;
     }
     
-    // 3. Fallback to Emergency Key (Most reliable for MVP)
-    if (EMERGENCY_KEY && EMERGENCY_KEY.startsWith("AIza")) {
+    // 4. Fallback to Emergency Key provided by user
+    if (EMERGENCY_KEY.startsWith("AIza")) {
         return EMERGENCY_KEY;
     }
 
@@ -44,15 +48,12 @@ export const hasValidKey = (): boolean => {
 };
 
 // --- TIMEOUT UTILS ---
-// Wrap promises to reject if they take too long
 const withTimeout = <T>(promise: Promise<T>, ms: number, fallbackValue?: T): Promise<T> => {
     return Promise.race([
         promise,
         new Promise<T>((_, reject) => 
             setTimeout(() => {
                 if (fallbackValue !== undefined) {
-                    // If fallback provided (e.g. mock script), resolve with it instead of throwing
-                    // However, usually we want to know it failed to log it.
                     reject(new Error("TIMEOUT")); 
                 } else {
                     reject(new Error("TIMEOUT"));
@@ -211,12 +212,12 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
   `;
 
   try {
-    // 10 Second timeout for script generation
+    // 12 Second timeout for script generation
     const response = await withTimeout(ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: { responseMimeType: "application/json" },
-    }), 12000); // 12s max
+    }), 12000); 
 
     const text = response.text;
     if (!text) throw new Error("No response from AI");
@@ -224,15 +225,14 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 
   } catch (error: any) {
     console.error("Gemini API Error:", error);
-    // FALLBACK FOR ANY ERROR (Timeout, 403, 500)
     console.warn("Generating Script Failed. Falling back to Mock Script.");
     return MOCK_SCRIPT;
   }
 };
 
-// Helper: Generate a simple beep WAV in base64
+// Helper: Return Safe SILENCE flag instead of corruptable base64
 export const generateMockAudioBase64 = (): string => {
-    return "UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="; 
+    return "SILENCE"; 
 }
 
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
@@ -248,7 +248,6 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
     const ai = new GoogleGenAI({ apiKey });
     
     // STRICT TIMEOUT FOR AUDIO: 8 Seconds per clip
-    // If it takes longer, we assume connection is hanging and failover to mock
     try {
         const response = await withTimeout(ai.models.generateContent({
             model: "gemini-2.5-flash-preview-tts",
@@ -268,7 +267,7 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
 
     } catch (e: any) {
         console.warn(`TTS Failed or Timed out:`, e.message);
-        // If error, return mock audio immediately so the video generation DOES NOT STOP
+        // Failover to Safe Silence
         return generateMockAudioBase64();
     }
 }
