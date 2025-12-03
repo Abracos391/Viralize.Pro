@@ -35,23 +35,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   useEffect(() => {
-    const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (!AudioContextClass) return;
+    try {
+        const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContextClass) return;
 
-    const ctx = new AudioContextClass();
-    const masterGain = ctx.createGain();
-    const analyser = ctx.createAnalyser();
+        const ctx = new AudioContextClass();
+        const masterGain = ctx.createGain();
+        const analyser = ctx.createAnalyser();
 
-    analyser.fftSize = 64; 
-    masterGain.gain.value = 1;
-    masterGain.connect(analyser);
-    analyser.connect(ctx.destination);
-    
-    audioCtxRef.current = ctx;
-    masterGainRef.current = masterGain;
-    analyserRef.current = analyser;
+        analyser.fftSize = 64; 
+        masterGain.gain.value = 1;
+        masterGain.connect(analyser);
+        analyser.connect(ctx.destination);
+        
+        audioCtxRef.current = ctx;
+        masterGainRef.current = masterGain;
+        analyserRef.current = analyser;
+    } catch (e) {
+        console.warn("Audio Context blocked or failed. Audio will be silent.", e);
+    }
 
-    return () => { if (ctx.state !== 'closed') ctx.close(); };
+    return () => { if (audioCtxRef.current?.state !== 'closed') audioCtxRef.current?.close(); };
   }, []);
 
   useEffect(() => {
@@ -59,21 +63,41 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   }, [isMuted]);
 
   // SAFE SILENT BUFFER GENERATOR
-  // Replaces the broken Base64 method which caused crashes
   const createSilentBuffer = (ctx: AudioContext): AudioBuffer => {
-      // Create a 1-second silent buffer
-      return ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+      if (!ctx) return new AudioBuffer({length: 44100, sampleRate: 44100}); // Mock for tests
+      return ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate); // 2 seconds silence
   };
 
-  const decodeAudio = async (base64: string, ctx: AudioContext): Promise<AudioBuffer> => {
+  // GENERATE PLACEHOLDER IMAGE (Data URI)
+  const createPlaceholderImage = (text: string, color: string) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1080;
+      canvas.height = 1920;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 1080, 1920);
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 80px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(text.toUpperCase(), 540, 960);
+      }
+      return canvas.toDataURL('image/jpeg', 0.8);
+  }
+
+  const decodeAudio = async (base64OrFlag: string, ctx: AudioContext): Promise<AudioBuffer> => {
+      // HANDLE "SILENCE" FLAG DIRECTLY - NO DECODING ATTEMPT
+      if (base64OrFlag === "SILENCE") {
+          return createSilentBuffer(ctx);
+      }
+
       try {
-          const binaryString = atob(base64);
+          const binaryString = atob(base64OrFlag);
           const len = binaryString.length;
           const bytes = new Uint8Array(len);
           for (let i = 0; i < len; i++) {
             bytes[i] = binaryString.charCodeAt(i);
           }
-          // Decode can fail if data is corrupt/empty
           return await ctx.decodeAudioData(bytes.buffer);
       } catch (e) {
           console.warn("Audio decoding failed, fallback to silence", e);
@@ -92,40 +116,56 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         try {
             setLoadingStatus("Analyzing visuals...");
             
-            // 1. Load Images with STRICT TIMEOUT
-            // Prevents app from hanging if an image URL is bad
+            // 1. Load Images with FALLBACK TO PLACEHOLDER
             const imagePromises = script.scenes.map(async (scene, i) => {
                  setLoadingStatus(`Fetching Image ${i+1}...`);
                  
-                 let imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`; // Default fallback
+                 let imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`; 
                  try {
                      const stockUrl = await getStockImage(scene.imageKeyword);
                      if (stockUrl) imageUrl = stockUrl;
                  } catch (e) {
-                     console.warn("Stock image fetch failed", e);
+                     console.warn("Stock fetch failed");
                  }
 
-                 imageUrlCache.current[scene.id] = imageUrl;
-                 
                  return new Promise<void>((resolve) => {
                     const img = new Image();
                     img.crossOrigin = "Anonymous"; 
                     
-                    const timeout = setTimeout(() => {
-                        console.warn(`Image load timeout for scene ${i}`);
-                        img.src = ""; // Cancel load
-                        resolve(); // Resolve anyway to not block app
-                    }, 5000);
+                    const finishWithImage = (src: string) => {
+                        imageUrlCache.current[scene.id] = src;
+                        // Reload img if source changed (e.g. fallback)
+                        if (img.src !== src) {
+                            img.src = src;
+                        } else {
+                            imageCache.current[scene.id] = img;
+                            resolve();
+                        }
+                    };
+
+                    const fallback = () => {
+                        console.warn(`Fallback image for scene ${i}`);
+                        const placeholder = createPlaceholderImage(scene.imageKeyword, '#374151');
+                        imageUrlCache.current[scene.id] = placeholder;
+                        const fallbackImg = new Image();
+                        fallbackImg.onload = () => {
+                            imageCache.current[scene.id] = fallbackImg;
+                            resolve();
+                        };
+                        fallbackImg.src = placeholder;
+                    };
+                    
+                    const timeout = setTimeout(fallback, 3000); // 3s Timeout
 
                     img.onload = () => { 
                         clearTimeout(timeout);
+                        imageUrlCache.current[scene.id] = imageUrl;
                         imageCache.current[scene.id] = img; 
                         resolve(); 
                     };
                     img.onerror = () => {
                         clearTimeout(timeout);
-                        console.warn(`Image failed to load for scene ${i}`);
-                        resolve(); // Resolve anyway
+                        fallback();
                     };
                     
                     img.src = imageUrl;
@@ -140,13 +180,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 
                 if (audioCtxRef.current) {
                     try {
-                        // Attempt generation
                         const base64Audio = await generateNarration(scene.narration);
                         const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
                         audioBufferCache.current[scene.id] = buffer;
                     } catch (e) {
-                         console.warn(`Audio generation/decoding failed for scene ${i+1}. Using silence.`);
-                         // 100% Safe Fallback
+                         console.warn(`Audio gen failed for scene ${i+1}. Using silence.`);
                          audioBufferCache.current[scene.id] = createSilentBuffer(audioCtxRef.current);
                     }
                 }
@@ -154,14 +192,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
             setAssetsLoaded(true);
             setLoadingStatus("Ready");
-            // Initial draw
             setTimeout(() => drawFrame(0, 0), 100);
 
         } catch (e: any) {
             console.error("FATAL ASSET ERROR:", e);
-            setLoadingStatus(`Error: ${e.message || "Initialization failed"}`);
-            // Even on fatal error, try to let user proceed with what we have
-            setAssetsLoaded(true); 
+            // DO NOT SHOW FATAL ERROR TO USER. FORCE LOADED STATE.
+            console.log("Forcing assets loaded despite error.");
+            setAssetsLoaded(true);
+            setLoadingStatus("Ready (Limited Mode)");
         }
     };
 
@@ -197,8 +235,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   };
 
   const handlePlayPause = async () => {
-    if (!audioCtxRef.current) return;
-    if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
+    if (audioCtxRef.current?.state === 'suspended') await audioCtxRef.current.resume();
 
     if (isPlaying) {
       setIsPlaying(false);
@@ -251,12 +288,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       const y = (height - scaledHeight) / 2;
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
     } else {
-      // Fallback if image failed to load
       ctx.fillStyle = '#1f2937';
       ctx.fillRect(0, 0, width, height);
       ctx.fillStyle = '#374151';
       ctx.textAlign = 'center';
-      ctx.fillText("Image Unavailable", width/2, height/2);
+      ctx.fillText("Visual Unavailable", width/2, height/2);
     }
 
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
@@ -379,8 +415,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     try {
         setLoadingStatus("Initializing Video Engine...");
         
-        // Ensure we pass SAFE AudioBuffers (no undefined)
-        // If an audio buffer is missing, generate silence on the fly
         const safeAudioBuffers: Record<number, AudioBuffer> = {};
         for(const scene of script.scenes) {
             if(audioBufferCache.current[scene.id]) {
@@ -390,9 +424,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             }
         }
 
+        // Validate images exist (fallback should have handled this, but double check)
+        const safeImages: Record<number, string> = {};
+        for(const scene of script.scenes) {
+            if (imageUrlCache.current[scene.id]) {
+                safeImages[scene.id] = imageUrlCache.current[scene.id];
+            } else {
+                safeImages[scene.id] = createPlaceholderImage(scene.imageKeyword, 'black');
+            }
+        }
+
         const videoBlob = await renderVideoWithFFmpeg(
             script,
-            imageUrlCache.current,
+            safeImages, 
             safeAudioBuffers,
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
