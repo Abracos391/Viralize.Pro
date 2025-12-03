@@ -25,29 +25,24 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   
   // Asset Caches
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
-  const imageUrlCache = useRef<Record<number, string>>({}); // Store URLs/Blobs for FFmpeg
+  const imageUrlCache = useRef<Record<number, string>>({}); 
   const audioBufferCache = useRef<Record<number, AudioBuffer>>({});
   
-  // Audio Context & Graph
+  // Audio Context
   const audioCtxRef = useRef<AudioContext | null>(null); 
   const masterGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-  // --- 1. INITIALIZE AUDIO ENGINE ---
   useEffect(() => {
     const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
     if (!AudioContextClass) return;
 
     const ctx = new AudioContextClass();
-    
-    // Nodes
     const masterGain = ctx.createGain();
     const analyser = ctx.createAnalyser();
 
-    // Config Analyser
     analyser.fftSize = 64; 
-
     masterGain.gain.value = 1;
     masterGain.connect(analyser);
     analyser.connect(ctx.destination);
@@ -56,19 +51,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     masterGainRef.current = masterGain;
     analyserRef.current = analyser;
 
-    return () => {
-        if (ctx.state !== 'closed') ctx.close();
-    };
+    return () => { if (ctx.state !== 'closed') ctx.close(); };
   }, []);
 
-  // Handle Mute
   useEffect(() => {
-    if (masterGainRef.current) {
-        masterGainRef.current.gain.value = isMuted ? 0 : 1;
-    }
+    if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
-  // --- 2. ASSET LOADING ---
   const decodeAudio = async (base64: string, ctx: AudioContext): Promise<AudioBuffer> => {
       const binaryString = atob(base64);
       const len = binaryString.length;
@@ -88,71 +77,49 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     
     const loadAssets = async () => {
         try {
-            setLoadingStatus("Preparing visuals...");
+            setLoadingStatus("Analyzing visuals...");
             
-            // Load Images
-            for (let i = 0; i < script.scenes.length; i++) {
-                 const scene = script.scenes[i];
-                 setLoadingStatus(`Loading Visuals ${i+1}/${script.scenes.length}...`);
-                 
+            // 1. Load Images (Parallel-ish)
+            const imagePromises = script.scenes.map(async (scene, i) => {
+                 setLoadingStatus(`Fetching Image ${i+1}...`);
                  const imageUrl = await getStockImage(scene.imageKeyword);
                  imageUrlCache.current[scene.id] = imageUrl;
-
-                 await new Promise<void>((resolve) => {
+                 
+                 return new Promise<void>((resolve) => {
                     const img = new Image();
                     img.crossOrigin = "Anonymous"; 
                     img.src = imageUrl;
-                    img.onload = () => {
-                        imageCache.current[scene.id] = img;
-                        resolve();
-                    };
+                    img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
                     img.onerror = () => {
                         const fallback = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
                         img.src = fallback;
                         imageUrlCache.current[scene.id] = fallback;
-                        setTimeout(resolve, 1000); 
+                        resolve(); // Resolve even on error to keep moving
                     };
                  });
-            }
+            });
+            await Promise.all(imagePromises);
 
-            // Load Audio
+            // 2. Load Audio (Sequential to avoid API rate limits, but with fast failover)
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
-                let success = false;
-                let attempts = 0;
-                const MAX_SCENE_RETRIES = 2; // REDUCED RETRIES FOR SPEED
+                setLoadingStatus(`Synthesizing Voice ${i + 1}/${script.scenes.length}...`);
                 
-                while (!success && attempts < MAX_SCENE_RETRIES) {
-                    setLoadingStatus(`Synthesizing Audio ${i + 1}/${script.scenes.length}...`);
+                try {
+                    // This now has a strict 8s timeout from geminiService
+                    const base64Audio = await generateNarration(scene.narration);
                     
-                    try {
-                        const base64Audio = await generateNarration(scene.narration, (msg) => {
-                            setLoadingStatus(`${msg} (Scene ${i+1})`); 
-                        });
-
-                        if (audioCtxRef.current && base64Audio) {
-                            const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
-                            audioBufferCache.current[scene.id] = buffer;
-                            success = true; 
-                        } else {
-                            throw new Error("Empty audio");
-                        }
-                    } catch (e) {
-                        attempts++;
-                        if (attempts >= MAX_SCENE_RETRIES) {
-                             console.warn(`Failed to generate audio for scene ${i+1}. Using fallback.`);
-                             // Fallback to mock audio to prevent infinite loop
-                             if (audioCtxRef.current) {
-                                 const mockB64 = generateMockAudioBase64();
-                                 const buffer = await decodeAudio(mockB64, audioCtxRef.current);
-                                 audioBufferCache.current[scene.id] = buffer;
-                                 success = true;
-                             }
-                        } else {
-                            setLoadingStatus(`Retrying (${attempts}/${MAX_SCENE_RETRIES})...`);
-                            await new Promise(r => setTimeout(r, 1000));
-                        }
+                    if (audioCtxRef.current) {
+                        const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
+                        audioBufferCache.current[scene.id] = buffer;
                     }
+                } catch (e) {
+                     console.warn(`Audio failed for scene ${i+1}, using silence.`);
+                     if (audioCtxRef.current) {
+                         const mockB64 = generateMockAudioBase64();
+                         const buffer = await decodeAudio(mockB64, audioCtxRef.current);
+                         audioBufferCache.current[scene.id] = buffer;
+                     }
                 }
             }
 
@@ -162,7 +129,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
         } catch (e) {
             console.error(e);
-            setLoadingStatus("Critical Error: Please refresh");
+            setLoadingStatus("Error initializing assets. Refresh page.");
         }
     };
 
@@ -174,7 +141,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     };
   }, [script]);
 
-  // --- 3. AUDIO CONTROL ---
   const stopAudio = () => {
     if (activeSourceRef.current) {
         try { activeSourceRef.current.stop(); } catch(e) {}
@@ -184,7 +150,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   const playSceneAudio = (sceneIndex: number) => {
     if (!audioCtxRef.current || !masterGainRef.current) return;
-    
     stopAudio(); 
 
     const sceneId = script.scenes[sceneIndex].id;
@@ -199,7 +164,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     }
   };
 
-  // --- 4. PLAYBACK LOGIC ---
   const handlePlayPause = async () => {
     if (!audioCtxRef.current) return;
     if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
@@ -234,7 +198,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     setTimeout(() => drawFrame(0, 0), 0);
   };
 
-  // --- 5. RENDER LOOP (VISUALS) ---
   const drawFrame = (sceneIndex: number, sceneProgressPercent: number) => {
     const canvas = canvasRef.current;
     if (!canvas || !assetsLoaded) return;
@@ -246,10 +209,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     const scene = script.scenes[sceneIndex];
     const img = imageCache.current[scene.id];
 
-    // Clear
     ctx.clearRect(0, 0, width, height);
 
-    // 1. Background Image
     if (img) {
       const scale = 1 + (sceneProgressPercent / 100) * 0.15; 
       const scaledWidth = width * scale;
@@ -262,11 +223,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       ctx.fillRect(0, 0, width, height);
     }
 
-    // 2. Overlay
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(0, 0, width, height);
 
-    // 3. Text: Overlay
     ctx.save();
     ctx.font = '900 60px Inter, sans-serif'; 
     ctx.textAlign = 'center';
@@ -274,20 +233,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     ctx.fillStyle = 'white';
     ctx.shadowColor = 'black';
     ctx.shadowBlur = 20;
-    const text = scene.overlayText.toUpperCase();
-    wrapText(ctx, text, width / 2, height / 2, width * 0.8, 75);
+    wrapText(ctx, scene.overlayText.toUpperCase(), width / 2, height / 2, width * 0.8, 75);
     ctx.restore();
 
-    // 4. Text: Subtitles
     ctx.save();
     ctx.font = 'bold 32px Inter, sans-serif';
     ctx.textAlign = 'center';
-    const narr = scene.narration;
     const narrY = height - 200;
-    wrapTextWithBg(ctx, narr, width/2, narrY, width * 0.9, 45);
+    wrapTextWithBg(ctx, scene.narration, width/2, narrY, width * 0.9, 45);
     ctx.restore();
 
-    // 5. Audio Visualizer
     if (analyserRef.current) {
         const bufferLength = analyserRef.current.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
@@ -351,10 +306,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
      });
   }
 
-  // --- 6. ANIMATION LOOP ---
   useEffect(() => {
     if (!isPlaying) return;
-
     const animate = () => {
       const now = Date.now();
       const currentScene = script.scenes[currentSceneIndex];
@@ -373,28 +326,22 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           stopAudio();
         }
       }
-
       if (sceneProgress > 100) sceneProgress = 100;
       setProgress(sceneProgress);
       drawFrame(currentSceneIndex, sceneProgress);
-
-      if (isPlaying) {
-        timerRef.current = requestAnimationFrame(animate);
-      }
+      if (isPlaying) timerRef.current = requestAnimationFrame(animate);
     };
-
     timerRef.current = requestAnimationFrame(animate);
     return () => { if(timerRef.current) cancelAnimationFrame(timerRef.current); };
   }, [isPlaying, currentSceneIndex]);
 
-  // --- 7. FFmpeg DOWNLOAD ---
   const startDownload = async () => {
     setIsDownloading(true);
     setIsPlaying(false);
     stopAudio();
 
     try {
-        setLoadingStatus("Initializing FFmpeg Engine...");
+        setLoadingStatus("Initializing Video Engine...");
         
         const videoBlob = await renderVideoWithFFmpeg(
             script,
@@ -424,7 +371,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   return (
     <div className="flex flex-col items-center justify-center w-full max-w-6xl mx-auto gap-8 lg:flex-row lg:items-start p-4">
       
-      {/* PHONE MOCKUP */}
       <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-[3rem] border-[8px] border-gray-800 shadow-2xl overflow-hidden ring-1 ring-gray-700">
         <div className="absolute top-0 left-1/2 transform -translate-x-1/2 w-32 h-6 bg-black rounded-b-xl z-20 pointer-events-none"></div>
 
@@ -440,7 +386,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                  <Loader2 className="animate-spin text-brand-500 mb-4" size={48} />
                  <h3 className="text-xl font-bold text-white mb-2">Rendering Video</h3>
                  <p className="text-sm text-gray-300">{loadingStatus}</p>
-                 <p className="text-xs text-gray-500 mt-4">Using browser-based FFmpeg. Do not close.</p>
+                 <p className="text-xs text-gray-500 mt-4">Browser-based rendering. Please wait.</p>
             </div>
         )}
 
@@ -452,7 +398,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         />
       </div>
 
-      {/* CONTROLS */}
       <div className="flex-1 w-full space-y-6">
         <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6 backdrop-blur-xl">
           <div className="flex justify-between items-start mb-4">
@@ -505,13 +450,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                ) : (
                    <>
                     <Download size={24} />
-                    Download MP4 (High Quality)
+                    Download MP4 (1080p)
                    </>
                )}
           </button>
           
           <div className="mt-4 text-xs text-gray-500 text-center">
-             <p>Generates 1080p MP4 with Hardcoded Subtitles using FFmpeg.wasm</p>
+             <p>Video generated locally using FFmpeg.wasm</p>
           </div>
         </div>
 
