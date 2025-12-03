@@ -25,13 +25,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   
   // Asset Caches
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
-  // Store raw binary data for FFmpeg
   const imageBinaryCache = useRef<Record<number, Uint8Array>>({});
   
   const audioBufferCache = useRef<Record<number, AudioBuffer>>({});
   const audioCtxRef = useRef<AudioContext | null>(null); 
   const masterGainRef = useRef<GainNode | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
   useEffect(() => {
@@ -40,14 +38,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         if (!AudioContextClass) return;
         const ctx = new AudioContextClass();
         const masterGain = ctx.createGain();
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64; 
         masterGain.gain.value = 1;
-        masterGain.connect(analyser);
-        analyser.connect(ctx.destination);
+        masterGain.connect(ctx.destination);
         audioCtxRef.current = ctx;
         masterGainRef.current = masterGain;
-        analyserRef.current = analyser;
     } catch (e) {
         console.warn("Audio Context failed.", e);
     }
@@ -58,9 +52,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
-  const createSilentBuffer = (ctx: AudioContext | null): AudioBuffer => {
-      if (!ctx) return new AudioBuffer({length: 44100, sampleRate: 44100, numberOfChannels: 1}); 
-      return ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+  const createSilentBuffer = (ctx: AudioContext | null, duration: number = 2.0): AudioBuffer => {
+      // Fallback object if ctx is null (SSR/No Audio)
+      const rate = ctx ? ctx.sampleRate : 44100;
+      const len = rate * duration;
+      const buf = ctx ? ctx.createBuffer(1, len, rate) : new AudioBuffer({length: len, sampleRate: rate, numberOfChannels: 1});
+      return buf;
   };
 
   const decodeAudio = async (base64OrFlag: string, ctx: AudioContext): Promise<AudioBuffer> => {
@@ -72,11 +69,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
           return await ctx.decodeAudioData(bytes.buffer);
       } catch (e) {
+          console.error("Audio decode error, using silence", e);
           return createSilentBuffer(ctx);
       }
   };
 
-  // Helper: Fetch URL as Uint8Array (Binary)
   const fetchImageAsBinary = async (url: string): Promise<Uint8Array> => {
       const resp = await fetch(url);
       if (!resp.ok) throw new Error("Image fetch failed");
@@ -94,11 +91,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     const loadAssets = async () => {
         setLoadingStatus("Downloading Assets...");
         
-        // 1. Load Images (Binary Fetch)
+        // 1. Load Images
         const imagePromises = script.scenes.map(async (scene, i) => {
-            setLoadingStatus(`Downloading Image ${i+1}...`);
-            
-            // Try Stock first, then Picsum
+            setLoadingStatus(`Getting Image ${i+1}...`);
             let imageUrl = '';
             try {
                 imageUrl = await getStockImage(scene.imageKeyword);
@@ -106,45 +101,30 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
             }
 
-            // Retry logic for fetching image binary
             let binaryData: Uint8Array | null = null;
-            let attempts = 0;
-            while (!binaryData && attempts < 3) {
+            try {
+                binaryData = await fetchImageAsBinary(imageUrl);
+            } catch (e) {
                 try {
-                    binaryData = await fetchImageAsBinary(imageUrl);
-                } catch (e) {
-                    attempts++;
-                    // Fallback to Picsum if Pexels fails
-                    if (attempts === 1) imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
+                     binaryData = await fetchImageAsBinary(`https://picsum.photos/seed/fallback/1080/1920`);
+                } catch {
+                     console.error("Critical image failure for scene", i);
+                     return; 
                 }
             }
 
-            if (!binaryData) {
-                // Should technically fail here, but we'll try one last desperation picsum
-                 try {
-                     binaryData = await fetchImageAsBinary(`https://picsum.photos/seed/error/1080/1920`);
-                 } catch {
-                     console.error("Critical image failure for scene", i);
-                     return; // Skip drawing this frame rather than crashing
-                 }
+            if (binaryData) {
+                imageBinaryCache.current[scene.id] = binaryData;
+                const blob = new Blob([binaryData]);
+                const objectUrl = URL.createObjectURL(blob);
+                
+                await new Promise<void>((resolve) => {
+                    const img = new Image();
+                    img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
+                    img.onerror = () => resolve(); 
+                    img.src = objectUrl;
+                });
             }
-
-            // Store Binary for FFmpeg
-            imageBinaryCache.current[scene.id] = binaryData;
-
-            // Create ObjectURL for Canvas Preview
-            const blob = new Blob([binaryData]);
-            const objectUrl = URL.createObjectURL(blob);
-            
-            await new Promise<void>((resolve) => {
-                const img = new Image();
-                img.onload = () => {
-                    imageCache.current[scene.id] = img;
-                    resolve();
-                };
-                img.onerror = () => resolve(); // Keep going even if decode fails
-                img.src = objectUrl;
-            });
         });
 
         await Promise.allSettled(imagePromises);
@@ -154,10 +134,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             const scene = script.scenes[i];
             setLoadingStatus(`Synthesizing Voice ${i + 1}...`);
             try {
-                const ctx = audioCtxRef.current;
                 const base64Audio = await generateNarration(scene.narration);
-                if (ctx) {
-                    const buffer = await decodeAudio(base64Audio, ctx);
+                if (audioCtxRef.current) {
+                    const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
                     audioBufferCache.current[scene.id] = buffer;
                 }
             } catch (e) {
@@ -173,11 +152,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     };
 
     loadAssets();
-
-    return () => {
-      stopAudio();
-      if (timerRef.current) cancelAnimationFrame(timerRef.current);
-    };
+    return () => { stopAudio(); if (timerRef.current) cancelAnimationFrame(timerRef.current); };
   }, [script]);
 
   const stopAudio = () => {
@@ -237,7 +212,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (!canvas || !assetsLoaded) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     const width = canvas.width;
     const height = canvas.height;
     const scene = script.scenes[sceneIndex];
@@ -256,7 +230,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       ctx.fillStyle = '#1f2937';
       ctx.fillRect(0, 0, width, height);
     }
-
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(0, 0, width, height);
 
@@ -321,51 +294,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
      });
   }
 
-  useEffect(() => {
-    if (!isPlaying) return;
-    const animate = () => {
-      const now = Date.now();
-      const currentScene = script.scenes[currentSceneIndex];
-      const elapsedInScene = (now - sceneStartTimeRef.current) / 1000;
-      let sceneProgress = (elapsedInScene / currentScene.duration) * 100;
-
-      if (sceneProgress >= 100) {
-        if (currentSceneIndex < script.scenes.length - 1) {
-          const nextIndex = currentSceneIndex + 1;
-          setCurrentSceneIndex(nextIndex);
-          sceneStartTimeRef.current = now;
-          playSceneAudio(nextIndex); 
-        } else {
-          setIsPlaying(false);
-          setProgress(100);
-          stopAudio();
-        }
-      }
-      if (sceneProgress > 100) sceneProgress = 100;
-      setProgress(sceneProgress);
-      drawFrame(currentSceneIndex, sceneProgress);
-      if (isPlaying) timerRef.current = requestAnimationFrame(animate);
-    };
-    timerRef.current = requestAnimationFrame(animate);
-    return () => { if(timerRef.current) cancelAnimationFrame(timerRef.current); };
-  }, [isPlaying, currentSceneIndex]);
-
-  // --- AUDIO STITCHING LOGIC ---
-  // Merges all individual scene audio buffers into ONE master audio buffer
-  // This ensures perfect sync and prevents FFmpeg filter complexity issues.
+  // --- AUDIO STITCHING ---
   const stitchAudioBuffers = async (scenes: typeof script.scenes, buffers: Record<number, AudioBuffer>): Promise<Uint8Array> => {
-      // 1. Calculate Total Duration
       const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
-      const sampleRate = 48000; // Standard for video
+      const sampleRate = 48000; 
       
-      // 2. Create Offline Context
-      // (window as any).OfflineAudioContext handles type check for older browsers
       const OfflineCtx = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
       const offlineCtx = new OfflineCtx(1, Math.ceil(totalDuration * sampleRate), sampleRate);
       
       let currentTime = 0;
-      
-      // 3. Schedule all clips
       for (const scene of scenes) {
           const buffer = buffers[scene.id];
           if (buffer) {
@@ -377,10 +314,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           currentTime += scene.duration;
       }
       
-      // 4. Render to Single Buffer
       const renderedBuffer = await offlineCtx.startRendering();
-      
-      // 5. Convert to WAV Bytes
       return audioBufferToWav(renderedBuffer);
   };
 
@@ -390,28 +324,25 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     stopAudio();
 
     try {
-        setLoadingStatus("Pre-processing Audio...");
-        
-        // 1. Stitch Audio
+        setLoadingStatus("Mixing Audio...");
+        // Generate Master Audio
         const masterAudioWav = await stitchAudioBuffers(script.scenes, audioBufferCache.current);
         
-        // 2. Prepare Images
+        // Prepare Images
         const safeImagesBinary: Record<number, Uint8Array> = {};
         for(const scene of script.scenes) {
             if (imageBinaryCache.current[scene.id]) {
                 safeImagesBinary[scene.id] = imageBinaryCache.current[scene.id];
             } else {
-                throw new Error("Image data missing");
+                throw new Error("Missing image data");
             }
         }
 
-        setLoadingStatus("Initializing Video Engine...");
-        
-        // 3. Send to FFmpeg
+        // Render
         const videoBlob = await renderVideoWithFFmpeg(
             script,
             safeImagesBinary,
-            masterAudioWav, // Pass single WAV file
+            masterAudioWav,
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
 
@@ -423,11 +354,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
-        
         setLoadingStatus("Ready");
     } catch (e: any) {
         console.error(e);
-        alert("Render failed: " + e.message);
+        alert(`Render Error: ${e.message}`);
     } finally {
         setIsDownloading(false);
     }
@@ -446,11 +376,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         )}
 
         {isDownloading && (
-            <div className="absolute inset-0 bg-black/80 z-40 flex flex-col items-center justify-center p-6 text-center">
+            <div className="absolute inset-0 bg-black/90 z-40 flex flex-col items-center justify-center p-6 text-center">
                  <Loader2 className="animate-spin text-brand-500 mb-4" size={48} />
                  <h3 className="text-xl font-bold text-white mb-2">Rendering Video</h3>
-                 <p className="text-sm text-gray-300">{loadingStatus}</p>
-                 <p className="text-xs text-gray-500 mt-4">High-performance local rendering...</p>
+                 <p className="text-sm text-gray-300 font-mono">{loadingStatus}</p>
+                 <div className="w-full bg-gray-800 h-2 rounded-full mt-4 overflow-hidden">
+                    <div className="h-full bg-brand-500 animate-pulse w-full"></div>
+                 </div>
             </div>
         )}
 
@@ -504,7 +436,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                {isDownloading ? (
                    <>
                     <Loader2 className="animate-spin" size={24} />
-                    Processing with FFmpeg...
+                    Processing...
                    </>
                ) : (
                    <>
