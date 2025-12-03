@@ -7,12 +7,18 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     define: {
-      // Polyfill process.env for the existing code structure
       'process.env.API_KEY': JSON.stringify(env.API_KEY || process.env.API_KEY),
       'process.env.PEXELS_API_KEY': JSON.stringify(env.PEXELS_API_KEY || process.env.PEXELS_API_KEY)
     },
     server: {
-      host: true
-    }
+      host: true,
+      headers: {
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
+      },
+    },
+    optimizeDeps: {
+      exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
+    },
   }
 })
