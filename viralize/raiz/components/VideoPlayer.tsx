@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, AlertCircle } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
-import { renderVideoWithFFmpeg } from '../services/ffmpegService';
+import { renderVideoWithFFmpeg, audioBufferToWav } from '../services/ffmpegService';
 
 interface VideoPlayerProps {
   script: GeneratedScript;
@@ -350,34 +350,68 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     return () => { if(timerRef.current) cancelAnimationFrame(timerRef.current); };
   }, [isPlaying, currentSceneIndex]);
 
+  // --- AUDIO STITCHING LOGIC ---
+  // Merges all individual scene audio buffers into ONE master audio buffer
+  // This ensures perfect sync and prevents FFmpeg filter complexity issues.
+  const stitchAudioBuffers = async (scenes: typeof script.scenes, buffers: Record<number, AudioBuffer>): Promise<Uint8Array> => {
+      // 1. Calculate Total Duration
+      const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
+      const sampleRate = 48000; // Standard for video
+      
+      // 2. Create Offline Context
+      // (window as any).OfflineAudioContext handles type check for older browsers
+      const OfflineCtx = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
+      const offlineCtx = new OfflineCtx(1, Math.ceil(totalDuration * sampleRate), sampleRate);
+      
+      let currentTime = 0;
+      
+      // 3. Schedule all clips
+      for (const scene of scenes) {
+          const buffer = buffers[scene.id];
+          if (buffer) {
+              const source = offlineCtx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(offlineCtx.destination);
+              source.start(currentTime);
+          }
+          currentTime += scene.duration;
+      }
+      
+      // 4. Render to Single Buffer
+      const renderedBuffer = await offlineCtx.startRendering();
+      
+      // 5. Convert to WAV Bytes
+      return audioBufferToWav(renderedBuffer);
+  };
+
   const startDownload = async () => {
     setIsDownloading(true);
     setIsPlaying(false);
     stopAudio();
 
     try {
-        setLoadingStatus("Initializing Video Engine...");
+        setLoadingStatus("Pre-processing Audio...");
         
-        const safeAudioBuffers: Record<number, AudioBuffer> = {};
-        for(const scene of script.scenes) {
-            safeAudioBuffers[scene.id] = audioBufferCache.current[scene.id] || createSilentBuffer(audioCtxRef.current);
-        }
-
-        // Pass BINARY data (Uint8Array) not URLs
-        // This guarantees FFmpeg has the exact bytes we downloaded
+        // 1. Stitch Audio
+        const masterAudioWav = await stitchAudioBuffers(script.scenes, audioBufferCache.current);
+        
+        // 2. Prepare Images
         const safeImagesBinary: Record<number, Uint8Array> = {};
         for(const scene of script.scenes) {
             if (imageBinaryCache.current[scene.id]) {
                 safeImagesBinary[scene.id] = imageBinaryCache.current[scene.id];
             } else {
-                throw new Error("Image binary data missing for scene " + scene.id);
+                throw new Error("Image data missing");
             }
         }
 
+        setLoadingStatus("Initializing Video Engine...");
+        
+        // 3. Send to FFmpeg
         const videoBlob = await renderVideoWithFFmpeg(
             script,
-            safeImagesBinary, // Passing binary data now
-            safeAudioBuffers,
+            safeImagesBinary,
+            masterAudioWav, // Pass single WAV file
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
 
