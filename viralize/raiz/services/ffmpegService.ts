@@ -28,7 +28,10 @@ export const loadFFmpeg = async (onLog?: (msg: string) => void): Promise<FFmpeg>
     if (ffmpeg) return ffmpeg;
     const instance = new FFmpeg();
     instance.on('log', ({ message }) => { if (onLog) onLog(message); });
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd';
+    
+    // Switch to jsDelivr and specific stable version 0.12.6 to avoid COEP issues with unpkg
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
+    
     try {
         await instance.load({
             coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
@@ -36,34 +39,29 @@ export const loadFFmpeg = async (onLog?: (msg: string) => void): Promise<FFmpeg>
         });
         ffmpeg = instance;
         return instance;
-    } catch (e) {
-        throw new Error("Failed to load video engine.");
+    } catch (e: any) {
+        console.error("FFmpeg Load Error:", e);
+        throw new Error(`Video Engine Load Failed: ${e.message}`);
     }
 };
 
-// --- FIXED WAV ENCODER ---
+// --- STANDARD WAV ENCODER (16-bit PCM) ---
 export function audioBufferToWav(buffer: AudioBuffer): Uint8Array {
-    const numChannels = buffer.numberOfChannels;
+    const numChannels = 1; // Force MONO for stability and file size
     const sampleRate = buffer.sampleRate;
     const format = 1; // PCM
     const bitDepth = 16;
     
-    // Interleave channels
     const length = buffer.length * numChannels;
     const result = new Int16Array(length);
-    let offset = 0;
     
-    // Get all channels
-    const channels = [];
-    for(let i=0; i < numChannels; i++) channels.push(buffer.getChannelData(i));
-
+    // Mix down to mono if needed or just take channel 0
+    const channel0 = buffer.getChannelData(0);
+    
     for (let i = 0; i < buffer.length; i++) {
-        for (let channel = 0; channel < numChannels; channel++) {
-            // Clamp and scale
-            const sample = Math.max(-1, Math.min(1, channels[channel][i]));
-            // Bit conversion (16-bit signed)
-            result[offset++] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-        }
+        const sample = Math.max(-1, Math.min(1, channel0[i]));
+        // 16-bit signed conversion
+        result[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
     }
 
     const bufferData = new Uint8Array(result.buffer);
@@ -100,14 +98,26 @@ export const renderVideoWithFFmpeg = async (
     masterAudioWav: Uint8Array,
     onProgress: (p: number, msg: string) => void
 ): Promise<Blob> => {
-    const ff = await loadFFmpeg((msg) => { if (msg.includes('frame=')) onProgress(60, "Rendering..."); });
+    // Force reset if needed
+    if (ffmpeg) {
+        try { 
+            // Optional: ffmpeg.terminate() if supported, but usually keeping instance is faster
+        } catch(e) {}
+    }
+
+    onProgress(5, "Loading Video Engine...");
+    const ff = await loadFFmpeg((msg) => { 
+        if (msg.includes('frame=')) onProgress(60, "Rendering frames..."); 
+    });
     
-    onProgress(10, "Loading Fonts...");
+    onProgress(15, "Loading Fonts...");
     try {
         await ff.writeFile('Roboto-Bold.ttf', await fetchFile('https://cdn.jsdelivr.net/npm/roboto-font@0.1.0/fonts/Roboto/roboto-bold.ttf'));
-    } catch (e) {}
+    } catch (e) {
+        console.warn("Font load failed", e);
+    }
 
-    onProgress(20, "Writing assets...");
+    onProgress(25, "Writing Assets...");
     const imageFiles: string[] = [];
 
     await ff.writeFile('subtitles.srt', generateSubtitleFile(script));
@@ -115,32 +125,32 @@ export const renderVideoWithFFmpeg = async (
 
     for (let i = 0; i < script.scenes.length; i++) {
         const scene = script.scenes[i];
-        
-        // Write Image
         const imgName = `img${i}.jpg`;
+        // Ensure we have data
+        if (!images[scene.id]) throw new Error(`Missing image data for scene ${i+1}`);
         await ff.writeFile(imgName, images[scene.id]);
         imageFiles.push(imgName);
     }
 
-    onProgress(30, "Configuring Filters...");
+    onProgress(40, "Configuring Filters...");
     let inputArgs: string[] = [];
     let concatVideo = "";
     
-    // Inputs (Images first)
+    // Inputs (Images)
     script.scenes.forEach((s, i) => inputArgs.push('-loop', '1', '-t', s.duration.toString(), '-i', imageFiles[i]));
     
-    // Input (Master Audio - Last Input)
+    // Input (Master Audio) is the LAST input
     const audioInputIndex = script.scenes.length;
     inputArgs.push('-i', 'master_audio.wav');
 
     const N = script.scenes.length;
 
     for (let i = 0; i < N; i++) {
-        // Video: Scale & Crop
+        // Video processing chain
         concatVideo += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}];`;
     }
 
-    // Simple Video Concat
+    // Video Concat
     let filterComplex = concatVideo;
     let videoStreamMap = "";
     for(let i=0; i<N; i++) videoStreamMap += `[v${i}]`;
@@ -150,25 +160,27 @@ export const renderVideoWithFFmpeg = async (
     const style = `Fontname=Roboto,Fontsize=24,PrimaryColour=&H00FFFF,BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=100`;
     filterComplex += `[vbase]subtitles=subtitles.srt:fontsdir=/:force_style='${style}'[vfinal]`;
 
-    onProgress(50, "Rendering...");
+    onProgress(50, "Starting Render...");
     const outputName = "output.mp4";
     try { await ff.deleteFile(outputName); } catch (e) {}
 
+    // Execute
+    // Strategy: Map [vfinal] video stream and the direct audio stream from master_audio.wav
     await ff.exec([
         ...inputArgs,
         '-filter_complex', filterComplex,
-        '-map', '[vfinal]',       // Mapped Video with Subs
-        '-map', `${audioInputIndex}:a`, // Map the Master Audio file directly
+        '-map', '[vfinal]',             // Video stream from filter
+        '-map', `${audioInputIndex}:a`, // Audio stream directly from WAV input
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',            // Convert WAV to AAC
-        '-b:a', '192k',
-        '-r', '30',
-        '-shortest',              // Stop when shortest stream ends
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-shortest',                    // End when audio ends
         outputName
     ]);
 
+    onProgress(90, "Finalizing...");
     const data = await ff.readFile(outputName);
     return new Blob([data], { type: 'video/mp4' });
 };
