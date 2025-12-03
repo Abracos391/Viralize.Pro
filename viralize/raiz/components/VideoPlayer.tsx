@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
-import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, Music4, AlertTriangle } from 'lucide-react';
+import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, AlertCircle } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
 import { renderVideoWithFFmpeg } from '../services/ffmpegService';
 
@@ -25,10 +25,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   
   // Asset Caches
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
-  const imageUrlCache = useRef<Record<number, string>>({}); 
-  const audioBufferCache = useRef<Record<number, AudioBuffer>>({});
+  // Store raw binary data for FFmpeg
+  const imageBinaryCache = useRef<Record<number, Uint8Array>>({});
   
-  // Audio Context
+  const audioBufferCache = useRef<Record<number, AudioBuffer>>({});
   const audioCtxRef = useRef<AudioContext | null>(null); 
   const masterGainRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -38,23 +38,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     try {
         const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
         if (!AudioContextClass) return;
-
         const ctx = new AudioContextClass();
         const masterGain = ctx.createGain();
         const analyser = ctx.createAnalyser();
-
         analyser.fftSize = 64; 
         masterGain.gain.value = 1;
         masterGain.connect(analyser);
         analyser.connect(ctx.destination);
-        
         audioCtxRef.current = ctx;
         masterGainRef.current = masterGain;
         analyserRef.current = analyser;
     } catch (e) {
-        console.warn("Audio Context blocked or failed. Audio will be silent.", e);
+        console.warn("Audio Context failed.", e);
     }
-
     return () => { if (audioCtxRef.current?.state !== 'closed') audioCtxRef.current?.close(); };
   }, []);
 
@@ -62,145 +58,118 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
-  // SAFE SILENT BUFFER GENERATOR
-  const createSilentBuffer = (ctx: AudioContext): AudioBuffer => {
-      if (!ctx) return new AudioBuffer({length: 44100, sampleRate: 44100}); // Mock for tests
-      return ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate); // 2 seconds silence
+  const createSilentBuffer = (ctx: AudioContext | null): AudioBuffer => {
+      if (!ctx) return new AudioBuffer({length: 44100, sampleRate: 44100, numberOfChannels: 1}); 
+      return ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
   };
 
-  // GENERATE PLACEHOLDER IMAGE (Data URI)
-  const createPlaceholderImage = (text: string, color: string) => {
-      const canvas = document.createElement('canvas');
-      canvas.width = 1080;
-      canvas.height = 1920;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = color;
-        ctx.fillRect(0, 0, 1080, 1920);
-        ctx.fillStyle = 'white';
-        ctx.font = 'bold 80px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(text.toUpperCase(), 540, 960);
-      }
-      return canvas.toDataURL('image/jpeg', 0.8);
-  }
-
   const decodeAudio = async (base64OrFlag: string, ctx: AudioContext): Promise<AudioBuffer> => {
-      // HANDLE "SILENCE" FLAG DIRECTLY - NO DECODING ATTEMPT
-      if (base64OrFlag === "SILENCE") {
-          return createSilentBuffer(ctx);
-      }
-
+      if (base64OrFlag === "SILENCE") return createSilentBuffer(ctx);
       try {
           const binaryString = atob(base64OrFlag);
           const len = binaryString.length;
           const bytes = new Uint8Array(len);
-          for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
+          for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
           return await ctx.decodeAudioData(bytes.buffer);
       } catch (e) {
-          console.warn("Audio decoding failed, fallback to silence", e);
           return createSilentBuffer(ctx);
       }
+  };
+
+  // Helper: Fetch URL as Uint8Array (Binary)
+  const fetchImageAsBinary = async (url: string): Promise<Uint8Array> => {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("Image fetch failed");
+      const buffer = await resp.arrayBuffer();
+      return new Uint8Array(buffer);
   };
 
   useEffect(() => {
     setAssetsLoaded(false);
     setIsPlaying(false);
     imageCache.current = {};
-    imageUrlCache.current = {};
+    imageBinaryCache.current = {};
     audioBufferCache.current = {};
     
     const loadAssets = async () => {
-        try {
-            setLoadingStatus("Analyzing visuals...");
+        setLoadingStatus("Downloading Assets...");
+        
+        // 1. Load Images (Binary Fetch)
+        const imagePromises = script.scenes.map(async (scene, i) => {
+            setLoadingStatus(`Downloading Image ${i+1}...`);
             
-            // 1. Load Images with FALLBACK TO PLACEHOLDER
-            const imagePromises = script.scenes.map(async (scene, i) => {
-                 setLoadingStatus(`Fetching Image ${i+1}...`);
-                 
-                 let imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`; 
-                 try {
-                     const stockUrl = await getStockImage(scene.imageKeyword);
-                     if (stockUrl) imageUrl = stockUrl;
-                 } catch (e) {
-                     console.warn("Stock fetch failed");
-                 }
+            // Try Stock first, then Picsum
+            let imageUrl = '';
+            try {
+                imageUrl = await getStockImage(scene.imageKeyword);
+            } catch {
+                imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
+            }
 
-                 return new Promise<void>((resolve) => {
-                    const img = new Image();
-                    img.crossOrigin = "Anonymous"; 
-                    
-                    const finishWithImage = (src: string) => {
-                        imageUrlCache.current[scene.id] = src;
-                        // Reload img if source changed (e.g. fallback)
-                        if (img.src !== src) {
-                            img.src = src;
-                        } else {
-                            imageCache.current[scene.id] = img;
-                            resolve();
-                        }
-                    };
-
-                    const fallback = () => {
-                        console.warn(`Fallback image for scene ${i}`);
-                        const placeholder = createPlaceholderImage(scene.imageKeyword, '#374151');
-                        imageUrlCache.current[scene.id] = placeholder;
-                        const fallbackImg = new Image();
-                        fallbackImg.onload = () => {
-                            imageCache.current[scene.id] = fallbackImg;
-                            resolve();
-                        };
-                        fallbackImg.src = placeholder;
-                    };
-                    
-                    const timeout = setTimeout(fallback, 3000); // 3s Timeout
-
-                    img.onload = () => { 
-                        clearTimeout(timeout);
-                        imageUrlCache.current[scene.id] = imageUrl;
-                        imageCache.current[scene.id] = img; 
-                        resolve(); 
-                    };
-                    img.onerror = () => {
-                        clearTimeout(timeout);
-                        fallback();
-                    };
-                    
-                    img.src = imageUrl;
-                 });
-            });
-            await Promise.all(imagePromises);
-
-            // 2. Load Audio with FALLBACK TO SILENCE
-            for (let i = 0; i < script.scenes.length; i++) {
-                const scene = script.scenes[i];
-                setLoadingStatus(`Synthesizing Voice ${i + 1}/${script.scenes.length}...`);
-                
-                if (audioCtxRef.current) {
-                    try {
-                        const base64Audio = await generateNarration(scene.narration);
-                        const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
-                        audioBufferCache.current[scene.id] = buffer;
-                    } catch (e) {
-                         console.warn(`Audio gen failed for scene ${i+1}. Using silence.`);
-                         audioBufferCache.current[scene.id] = createSilentBuffer(audioCtxRef.current);
-                    }
+            // Retry logic for fetching image binary
+            let binaryData: Uint8Array | null = null;
+            let attempts = 0;
+            while (!binaryData && attempts < 3) {
+                try {
+                    binaryData = await fetchImageAsBinary(imageUrl);
+                } catch (e) {
+                    attempts++;
+                    // Fallback to Picsum if Pexels fails
+                    if (attempts === 1) imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
                 }
             }
 
-            setAssetsLoaded(true);
-            setLoadingStatus("Ready");
-            setTimeout(() => drawFrame(0, 0), 100);
+            if (!binaryData) {
+                // Should technically fail here, but we'll try one last desperation picsum
+                 try {
+                     binaryData = await fetchImageAsBinary(`https://picsum.photos/seed/error/1080/1920`);
+                 } catch {
+                     console.error("Critical image failure for scene", i);
+                     return; // Skip drawing this frame rather than crashing
+                 }
+            }
 
-        } catch (e: any) {
-            console.error("FATAL ASSET ERROR:", e);
-            // DO NOT SHOW FATAL ERROR TO USER. FORCE LOADED STATE.
-            console.log("Forcing assets loaded despite error.");
-            setAssetsLoaded(true);
-            setLoadingStatus("Ready (Limited Mode)");
+            // Store Binary for FFmpeg
+            imageBinaryCache.current[scene.id] = binaryData;
+
+            // Create ObjectURL for Canvas Preview
+            const blob = new Blob([binaryData]);
+            const objectUrl = URL.createObjectURL(blob);
+            
+            await new Promise<void>((resolve) => {
+                const img = new Image();
+                img.onload = () => {
+                    imageCache.current[scene.id] = img;
+                    resolve();
+                };
+                img.onerror = () => resolve(); // Keep going even if decode fails
+                img.src = objectUrl;
+            });
+        });
+
+        await Promise.allSettled(imagePromises);
+
+        // 2. Load Audio
+        for (let i = 0; i < script.scenes.length; i++) {
+            const scene = script.scenes[i];
+            setLoadingStatus(`Synthesizing Voice ${i + 1}...`);
+            try {
+                const ctx = audioCtxRef.current;
+                const base64Audio = await generateNarration(scene.narration);
+                if (ctx) {
+                    const buffer = await decodeAudio(base64Audio, ctx);
+                    audioBufferCache.current[scene.id] = buffer;
+                }
+            } catch (e) {
+                 if (audioCtxRef.current) {
+                    audioBufferCache.current[scene.id] = createSilentBuffer(audioCtxRef.current);
+                }
+            }
         }
+
+        setAssetsLoaded(true);
+        setLoadingStatus("Ready");
+        setTimeout(() => drawFrame(0, 0), 100);
     };
 
     loadAssets();
@@ -221,10 +190,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const playSceneAudio = (sceneIndex: number) => {
     if (!audioCtxRef.current || !masterGainRef.current) return;
     stopAudio(); 
-
     const sceneId = script.scenes[sceneIndex].id;
     const buffer = audioBufferCache.current[sceneId];
-
     if (buffer) {
         const source = audioCtxRef.current.createBufferSource();
         source.buffer = buffer;
@@ -236,14 +203,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   const handlePlayPause = async () => {
     if (audioCtxRef.current?.state === 'suspended') await audioCtxRef.current.resume();
-
     if (isPlaying) {
       setIsPlaying(false);
       stopAudio();
       if (timerRef.current) cancelAnimationFrame(timerRef.current);
     } else {
       setIsPlaying(true);
-      
       if (currentSceneIndex >= script.scenes.length - 1 && progress >= 100) {
         setCurrentSceneIndex(0);
         setProgress(0);
@@ -290,9 +255,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     } else {
       ctx.fillStyle = '#1f2937';
       ctx.fillRect(0, 0, width, height);
-      ctx.fillStyle = '#374151';
-      ctx.textAlign = 'center';
-      ctx.fillText("Visual Unavailable", width/2, height/2);
     }
 
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
@@ -314,25 +276,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     const narrY = height - 200;
     wrapTextWithBg(ctx, scene.narration, width/2, narrY, width * 0.9, 45);
     ctx.restore();
-
-    if (analyserRef.current) {
-        const bufferLength = analyserRef.current.frequencyBinCount;
-        const dataArray = new Uint8Array(bufferLength);
-        analyserRef.current.getByteFrequencyData(dataArray);
-
-        const barWidth = (width / 16) - 10;
-        let x = (width - ((barWidth + 10) * 16)) / 2;
-
-        ctx.fillStyle = '#22c55e';
-        for(let i = 0; i < 16; i++) {
-            const val = dataArray[i + 2] || 0; 
-            const barHeight = (val / 255) * 100;
-            if (barHeight > 5) {
-                ctx.fillRect(x, height - 120 - barHeight, barWidth, barHeight);
-            }
-            x += barWidth + 10;
-        }
-    }
   };
 
   const wrapText = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number) => {
@@ -417,26 +360,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         
         const safeAudioBuffers: Record<number, AudioBuffer> = {};
         for(const scene of script.scenes) {
-            if(audioBufferCache.current[scene.id]) {
-                safeAudioBuffers[scene.id] = audioBufferCache.current[scene.id];
-            } else if (audioCtxRef.current) {
-                safeAudioBuffers[scene.id] = createSilentBuffer(audioCtxRef.current);
-            }
+            safeAudioBuffers[scene.id] = audioBufferCache.current[scene.id] || createSilentBuffer(audioCtxRef.current);
         }
 
-        // Validate images exist (fallback should have handled this, but double check)
-        const safeImages: Record<number, string> = {};
+        // Pass BINARY data (Uint8Array) not URLs
+        // This guarantees FFmpeg has the exact bytes we downloaded
+        const safeImagesBinary: Record<number, Uint8Array> = {};
         for(const scene of script.scenes) {
-            if (imageUrlCache.current[scene.id]) {
-                safeImages[scene.id] = imageUrlCache.current[scene.id];
+            if (imageBinaryCache.current[scene.id]) {
+                safeImagesBinary[scene.id] = imageBinaryCache.current[scene.id];
             } else {
-                safeImages[scene.id] = createPlaceholderImage(scene.imageKeyword, 'black');
+                throw new Error("Image binary data missing for scene " + scene.id);
             }
         }
 
         const videoBlob = await renderVideoWithFFmpeg(
             script,
-            safeImages, 
+            safeImagesBinary, // Passing binary data now
             safeAudioBuffers,
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
@@ -461,7 +401,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   return (
     <div className="flex flex-col items-center justify-center w-full max-w-6xl mx-auto gap-8 lg:flex-row lg:items-start p-4">
-      
       <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-[3rem] border-[8px] border-gray-800 shadow-2xl overflow-hidden ring-1 ring-gray-700">
         <div className="absolute top-0 left-1/2 transform -translate-x-1/2 w-32 h-6 bg-black rounded-b-xl z-20 pointer-events-none"></div>
 
@@ -477,16 +416,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                  <Loader2 className="animate-spin text-brand-500 mb-4" size={48} />
                  <h3 className="text-xl font-bold text-white mb-2">Rendering Video</h3>
                  <p className="text-sm text-gray-300">{loadingStatus}</p>
-                 <p className="text-xs text-gray-500 mt-4">Browser-based rendering. Please wait.</p>
+                 <p className="text-xs text-gray-500 mt-4">High-performance local rendering...</p>
             </div>
         )}
 
-        <canvas 
-            ref={canvasRef}
-            width={540} 
-            height={960}
-            className="w-full h-full object-cover bg-gray-900"
-        />
+        <canvas ref={canvasRef} width={540} height={960} className="w-full h-full object-cover bg-gray-900"/>
       </div>
 
       <div className="flex-1 w-full space-y-6">
@@ -545,12 +479,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                    </>
                )}
           </button>
-          
-          <div className="mt-4 text-xs text-gray-500 text-center">
-             <p>Video generated locally using FFmpeg.wasm</p>
-          </div>
         </div>
-
         <button onClick={onEditRequest} disabled={isDownloading} className="text-sm text-gray-500 hover:text-white underline w-full text-center">
           Create New Video
         </button>
