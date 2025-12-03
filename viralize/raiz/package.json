@@ -14,9 +14,7 @@
     "react-dom": "^18.3.1",
     "lucide-react": "^0.344.0",
     "@google/genai": "latest",
-    "express": "^4.19.2",
-    "@ffmpeg/ffmpeg": "^0.12.10",
-    "@ffmpeg/util": "^0.12.1"
+    "express": "^4.19.2"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
@@ -31,4 +29,3 @@
   "engines": {
     "node": ">=18.0.0"
   }
-}
