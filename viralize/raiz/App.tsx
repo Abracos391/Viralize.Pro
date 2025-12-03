@@ -146,12 +146,13 @@ const App: React.FC = () => {
       const safetyCheck = await validateContentSafety(data.productName, data.description);
       
       if (!safetyCheck.isSafe) {
+          // NON-BLOCKING WARNING
           setComplianceError({
-              title: "Compliance Violation Detected",
-              msg: `Reason: ${safetyCheck.reason}. Suggestion: ${safetyCheck.suggestion}`
+              title: "Compliance Warning",
+              msg: `Caution: ${safetyCheck.reason}. Generation continued automatically.`
           });
-          setAppState('input');
-          return;
+          console.warn("Safety check failed but proceeding based on user override request:", safetyCheck);
+          // We NO LONGER return here. We proceed to generate.
       }
 
       // 2. GENERATE SCRIPT
@@ -215,9 +216,6 @@ const App: React.FC = () => {
             <div>
                 <h3 className="font-bold text-lg text-orange-400 mb-1">{complianceError.title}</h3>
                 <p className="text-orange-100/80 mb-2">{complianceError.msg}</p>
-                <div className="text-xs bg-black/30 p-2 rounded text-orange-300 font-mono">
-                    ViralizePro Intelligence Blocked this generation to protect your account.
-                </div>
             </div>
           </div>
         )}
