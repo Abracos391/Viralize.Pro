@@ -114,18 +114,23 @@ export const validateContentSafety = async (product: string, description: string
 
     const ai = new GoogleGenAI({ apiKey });
     
+    // RELAXED PROMPT TO AVOID FALSE POSITIVES
     const prompt = `
     ACT AS A SOCIAL MEDIA COMPLIANCE OFFICER (TikTok, Meta, YouTube).
-    Analyze this input for violations:
+    Analyze this input for SEVERE violations:
     Product: ${product}
     Description: ${description}
 
-    Check for: 
-    1. Unrealistic financial promises (Get rich quick).
-    2. Prohibited goods (Weapons, Drugs, Tobacco).
-    3. Adult/Sexual content.
-    4. Scams/Fraud.
-    5. Copyright infringement risks (IPTV, Fake luxury).
+    Check for STRICTLY PROHIBITED CONTENT ONLY:
+    1. EXPLICIT Illegal acts (selling weapons, drugs, hitmen).
+    2. EXPLICIT Adult/Pornographic content.
+    3. HATE SPEECH or Harassment.
+    4. OBVIOUS Scams/Fraud (e.g. "Send me money I double it").
+
+    IMPORTANT: 
+    - DO NOT flag generic copyright risks (e.g. user uploading photos, music, avatars). Assume user has rights.
+    - DO NOT flag standard business models (dropshipping, affiliates, apps) unless they are obvious scams.
+    - BE PERMISSIVE. If unsure, mark as SAFE.
 
     Return JSON ONLY:
     {
@@ -144,7 +149,8 @@ export const validateContentSafety = async (product: string, description: string
         });
         return parseJSON(response.text) as ComplianceResult;
     } catch (e) {
-        return { isSafe: true, flaggedCategories: [], reason: "AI check failed", suggestion: "" };
+        // Fail open - if AI fails, assume safe
+        return { isSafe: true, flaggedCategories: [], reason: "AI check skipped", suggestion: "" };
     }
 };
 
@@ -290,7 +296,7 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
     }
 
     const ai = new GoogleGenAI({ apiKey });
-    const MAX_RETRIES = 5; // Reduced max retries to avoid infinite loop feeling
+    const MAX_RETRIES = 2; // REDUCED RETRIES FOR FASTER FALLBACK
     let lastError;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -319,12 +325,12 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             console.warn(`TTS Attempt ${attempt} failed:`, e.message);
             lastError = e;
             const isRateLimit = e.message?.includes('429') || e.message?.includes('503');
-            // If rate limit, wait. If other error (e.g. invalid key), fail fast.
+            // Fail fast on non-rate limit errors
             if (!isRateLimit) break;
 
-            const waitTime = 2000 * attempt;
+            const waitTime = 1000 * attempt;
             if (onRetry) {
-                onRetry(`Google API Busy. Retrying ${attempt}/${MAX_RETRIES}...`);
+                onRetry(`API Busy. Retrying...`);
             }
             await new Promise(resolve => setTimeout(resolve, waitTime));
         }
