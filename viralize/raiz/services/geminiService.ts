@@ -2,6 +2,9 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, MarketingGoal } from "../types";
 
 // --- API KEY MANAGER ---
+// USER PROVIDED KEY INJECTED FOR IMMEDIATE FIX
+const EMERGENCY_KEY = "AIzaSyC_Xye5mxdCgNvRjCL9XLKJXUF8z7XrUTI";
+
 export const getApiKey = (): string => {
     // 1. Check Environment Variable (Build time / Render)
     const envKey = process.env.API_KEY;
@@ -10,9 +13,12 @@ export const getApiKey = (): string => {
     }
     // 2. Check Browser Storage (Runtime)
     if (typeof window !== 'undefined') {
-        return localStorage.getItem('GEMINI_API_KEY') || '';
+        const localKey = localStorage.getItem('GEMINI_API_KEY');
+        if (localKey && localKey.length > 10) return localKey;
     }
-    return '';
+    
+    // 3. Fallback to Emergency Key provided by user
+    return EMERGENCY_KEY;
 };
 
 export const setRuntimeApiKey = (key: string) => {
@@ -247,11 +253,9 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 };
 
 // Helper: Generate a simple beep WAV in base64 for demo purposes
-const generateMockAudioBase64 = (): string => {
-    // Very simple WAV header for 1 second of silence/noise to keep FFmpeg happy
-    // This is a minimal valid 16-bit PCM WAV
-    const header = "UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="; // Empty valid wav
-    return header; 
+// Valid 16-bit PCM WAV (Silence/Beep)
+export const generateMockAudioBase64 = (): string => {
+    return "UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="; 
 }
 
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
@@ -266,14 +270,11 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
     // BYPASS: If no key, return dummy audio so FFmpeg doesn't crash
     if (!apiKey) {
         console.warn("No API Key. Returning mock audio.");
-        // We return a small valid WAV string. The user won't hear voice, but the video will build.
-        // For a better experience, we could return a predefined b64 string of a generic voice, 
-        // but for now we prioritize not crashing.
         return generateMockAudioBase64();
     }
 
     const ai = new GoogleGenAI({ apiKey });
-    const MAX_RETRIES = 50; 
+    const MAX_RETRIES = 5; // Reduced max retries to avoid infinite loop feeling
     let lastError;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -302,14 +303,16 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
             console.warn(`TTS Attempt ${attempt} failed:`, e.message);
             lastError = e;
             const isRateLimit = e.message?.includes('429') || e.message?.includes('503');
-            const waitTime = isRateLimit ? 30000 : 5000 + (attempt * 1000);
-            
+            // If rate limit, wait. If other error (e.g. invalid key), fail fast.
+            if (!isRateLimit) break;
+
+            const waitTime = 2000 * attempt;
             if (onRetry) {
-                const timeLeft = Math.round(waitTime/1000);
-                onRetry(isRateLimit ? `Google API Traffic. Waiting ${timeLeft}s...` : `Retrying connection (${attempt})...`);
+                onRetry(`Google API Busy. Retrying ${attempt}/${MAX_RETRIES}...`);
             }
             await new Promise(resolve => setTimeout(resolve, waitTime));
         }
     }
+    // If all failed, throw error to let player handle fallback
     throw lastError || new Error("Failed to generate audio.");
 }
