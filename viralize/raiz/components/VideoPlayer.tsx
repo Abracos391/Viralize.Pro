@@ -3,7 +3,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, AlertCircle } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
-import { renderVideoWithFFmpeg, audioBufferToWav } from '../services/ffmpegService';
 
 interface VideoPlayerProps {
   script: GeneratedScript;
@@ -30,6 +29,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const audioCtxRef = useRef<AudioContext | null>(null); 
   const masterGainRef = useRef<GainNode | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  
+  // Recorder Refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
 
   // Init Audio Context Safely
   useEffect(() => {
@@ -40,6 +44,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         const masterGain = ctx.createGain();
         masterGain.gain.value = 1;
         masterGain.connect(ctx.destination);
+        
+        // Create Destination for Recording
+        const dest = ctx.createMediaStreamDestination();
+        masterGain.connect(dest);
+        destNodeRef.current = dest;
+
         audioCtxRef.current = ctx;
         masterGainRef.current = masterGain;
     } catch (e) {
@@ -84,7 +94,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     const loadAssets = async () => {
         setLoadingStatus("Downloading Assets...");
         
-        // 1. Load Images (as HTMLImageElements)
+        // 1. Load Images
         const imagePromises = script.scenes.map(async (scene, i) => {
             setLoadingStatus(`Fetching Image ${i+1}...`);
             let imageUrl = '';
@@ -96,20 +106,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
             await new Promise<void>((resolve) => {
                 const img = new Image();
-                img.crossOrigin = "anonymous"; // CRITICAL FOR CANVAS EXPORT
-                
-                // CACHE BUSTING: KEY ELEMENT FOR FIXING TAINTED CANVAS
-                // Appending time ensures we get a fresh image with correct CORS headers
+                img.crossOrigin = "anonymous"; 
                 const safeUrl = imageUrl.includes('?') 
                     ? `${imageUrl}&t=${Date.now()}` 
                     : `${imageUrl}?t=${Date.now()}`;
                 
                 img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
                 img.onerror = () => {
-                    // Retry once with placeholder to guarantee visual
                     img.src = `https://picsum.photos/seed/fallback_${i}/1080/1920?t=${Date.now()}`; 
                     img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
-                    img.onerror = () => resolve(); // Give up, preProcess will handle missing
+                    img.onerror = () => resolve(); 
                 };
                 img.src = safeUrl;
             });
@@ -173,30 +179,65 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       if (timerRef.current) cancelAnimationFrame(timerRef.current);
     } else {
       setIsPlaying(true);
+      // Logic to continue or restart
       if (currentSceneIndex >= script.scenes.length - 1 && progress >= 100) {
-        setCurrentSceneIndex(0);
-        setProgress(0);
-        sceneStartTimeRef.current = Date.now();
-        playSceneAudio(0);
+        restartSequence();
       } else {
         const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
         const elapsed = (progress / 100) * sceneDur;
         sceneStartTimeRef.current = Date.now() - elapsed;
         playSceneAudio(currentSceneIndex); 
+        runAnimationLoop();
       }
     }
   };
 
-  const handleRestart = () => {
-    setIsPlaying(false);
-    setCurrentSceneIndex(0);
-    setProgress(0);
-    stopAudio();
-    if (timerRef.current) cancelAnimationFrame(timerRef.current);
-    setTimeout(() => drawFrame(0, 0), 0);
+  const restartSequence = () => {
+      setCurrentSceneIndex(0);
+      setProgress(0);
+      sceneStartTimeRef.current = Date.now();
+      playSceneAudio(0);
+      runAnimationLoop();
+  }
+
+  const runAnimationLoop = () => {
+    const loop = () => {
+        const now = Date.now();
+        const elapsed = now - sceneStartTimeRef.current;
+        const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
+        let newProgress = (elapsed / sceneDur) * 100;
+
+        if (newProgress >= 100) {
+            if (currentSceneIndex < script.scenes.length - 1) {
+                // Next Scene
+                setCurrentSceneIndex(prev => {
+                    const next = prev + 1;
+                    sceneStartTimeRef.current = Date.now();
+                    playSceneAudio(next);
+                    return next;
+                });
+                setProgress(0);
+                timerRef.current = requestAnimationFrame(loop);
+            } else {
+                // End of video
+                if (isDownloading) {
+                    finishRecording(); // Stop recording if we are in download mode
+                } else {
+                    setIsPlaying(false);
+                    stopAudio();
+                    setProgress(100);
+                }
+            }
+        } else {
+            setProgress(newProgress);
+            drawFrame(currentSceneIndex, newProgress);
+            timerRef.current = requestAnimationFrame(loop);
+        }
+    };
+    timerRef.current = requestAnimationFrame(loop);
   };
 
-  // --- CANVAS DRAWING (USED FOR PREVIEW AND EXPORT) ---
+  // --- CANVAS DRAWING ---
   const drawFrame = (sceneIndex: number, sceneProgressPercent: number) => {
     const canvas = canvasRef.current;
     if (!canvas || !assetsLoaded) return;
@@ -211,25 +252,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
     ctx.clearRect(0, 0, width, height);
 
-    // 1. Draw Image
     if (img) {
-      const scale = 1 + (progress / 100) * 0.10; 
+      const scale = 1 + (progress / 100) * 0.10; // Zoom effect
       const scaledWidth = width * scale;
       const scaledHeight = height * scale;
       const x = (width - scaledWidth) / 2;
       const y = (height - scaledHeight) / 2;
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
     } else {
-      // Fallback for missing image - Draw colored background
-      ctx.fillStyle = sceneIndex % 2 === 0 ? '#1f2937' : '#111827';
+      ctx.fillStyle = '#111827';
       ctx.fillRect(0, 0, width, height);
     }
     
-    // 2. Overlay Darken
+    // Overlay
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(0, 0, width, height);
 
-    // 3. Text Drawing (Burned In)
+    // Text - Burned In
     ctx.save();
     ctx.font = '900 60px Inter, sans-serif'; 
     ctx.textAlign = 'center';
@@ -240,7 +279,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     wrapText(ctx, scene.overlayText.toUpperCase(), width / 2, height / 2, width * 0.8, 75);
     ctx.restore();
 
-    // Narration Subtitles
+    // Subtitles
     ctx.save();
     ctx.font = 'bold 32px Inter, sans-serif';
     ctx.textAlign = 'center';
@@ -292,141 +331,81 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
      });
   }
 
-  // --- GENERATE PRE-PROCESSED IMAGES FOR FFMPEG ---
-  const preProcessImages = async (): Promise<Record<number, Uint8Array>> => {
-      const offCanvas = document.createElement('canvas');
-      offCanvas.width = 1080;
-      offCanvas.height = 1920;
-      const ctx = offCanvas.getContext('2d');
-      if(!ctx) throw new Error("Canvas init failed");
+  // --- NATIVE BROWSER RECORDING ---
+  const startRecording = async () => {
+      if (!canvasRef.current || !destNodeRef.current || !audioCtxRef.current) {
+          alert("Recording not supported on this browser.");
+          return;
+      }
 
-      const processed: Record<number, Uint8Array> = {};
+      setIsDownloading(true);
+      setLoadingStatus("Recording in real-time (Please wait)...");
+      setIsPlaying(true);
+      stopAudio(); // Reset state
 
-      for (const scene of script.scenes) {
-          try {
-             // We use a fresh context drawing for each scene
-             renderSceneToContext(ctx, 1080, 1920, script.scenes.indexOf(scene), 0);
-             
-             // Convert to Blob
-             const blob = await new Promise<Blob | null>(r => offCanvas.toBlob(r, 'image/jpeg', 0.9));
-             
-             if (blob) {
-                  const buf = await blob.arrayBuffer();
-                  processed[scene.id] = new Uint8Array(buf);
-             } else {
-                 throw new Error("Tainted Canvas or null blob");
-             }
-          } catch (e) {
-             console.error(`Failed to process scene ${scene.id}, using safety fallback`, e);
-             // Safety Fallback: Draw simple color background with text
-             ctx.fillStyle = '#374151';
-             ctx.fillRect(0,0,1080,1920);
-             ctx.fillStyle = 'white';
-             ctx.font = '50px sans-serif';
-             ctx.fillText(scene.overlayText, 100, 960);
-             
-             const fallbackBlob = await new Promise<Blob | null>(r => offCanvas.toBlob(r, 'image/jpeg', 0.8));
-             if(fallbackBlob) {
-                 const buf = await fallbackBlob.arrayBuffer();
-                 processed[scene.id] = new Uint8Array(buf);
-             }
+      // 1. Capture Canvas Stream
+      const canvasStream = canvasRef.current.captureStream(30); // 30 FPS
+      
+      // 2. Capture Audio Stream
+      const audioStream = destNodeRef.current.stream;
+      
+      // 3. Combine
+      const combinedStream = new MediaStream([
+          ...canvasStream.getVideoTracks(),
+          ...audioStream.getAudioTracks()
+      ]);
+
+      // 4. Start Recorder
+      // Try widely supported codecs
+      let mimeType = 'video/webm;codecs=vp9';
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm;codecs=vp8';
+          if (!MediaRecorder.isTypeSupported(mimeType)) {
+              mimeType = 'video/webm';
           }
       }
-      return processed;
-  }
 
-  // --- AUDIO STITCHING (STEREO) ---
-  const stitchAudioBuffers = async (scenes: typeof script.scenes, buffers: Record<number, AudioBuffer>): Promise<Uint8Array> => {
-      const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
-      const sampleRate = 44100; 
-      
-      const OfflineCtx = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
-      // Use 2 channels for Stereo output compat
-      const offlineCtx = new OfflineCtx(2, Math.ceil(totalDuration * sampleRate), sampleRate);
-      
-      let currentTime = 0;
-      for (const scene of scenes) {
-          const buffer = buffers[scene.id];
-          if (buffer) {
-              const source = offlineCtx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(offlineCtx.destination);
-              source.start(currentTime);
+      const recorder = new MediaRecorder(combinedStream, {
+          mimeType,
+          videoBitsPerSecond: 5000000 // 5 Mbps
+      });
+
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+          const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${script.title.replace(/\s+/g, '_')}_viralize.webm`;
+          document.body.appendChild(a);
+          a.click();
+          window.URL.revokeObjectURL(url);
+          setIsDownloading(false);
+          setLoadingStatus("Ready");
+          setIsPlaying(false);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+
+      // Start Playback Loop
+      restartSequence();
+  };
+
+  const finishRecording = () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+          stopAudio();
+          // Ensure we stop tracks to release memory
+          if (mediaRecorderRef.current.stream) {
+              mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
           }
-          currentTime += scene.duration;
       }
-      
-      const renderedBuffer = await offlineCtx.startRendering();
-      return audioBufferToWav(renderedBuffer);
   };
-
-  const startDownload = async () => {
-    setIsDownloading(true);
-    setIsPlaying(false);
-    stopAudio();
-
-    try {
-        setLoadingStatus("Processing Visuals...");
-        const processedImages = await preProcessImages();
-
-        setLoadingStatus("Mixing Audio...");
-        const masterAudioWav = await stitchAudioBuffers(script.scenes, audioBufferCache.current);
-        
-        // Render
-        const videoBlob = await renderVideoWithFFmpeg(
-            script,
-            processedImages,
-            masterAudioWav,
-            (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
-        );
-
-        const url = URL.createObjectURL(videoBlob);
-        const a = document.createElement('a');
-        a.style.display = 'none';
-        a.href = url;
-        a.download = `${script.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        setLoadingStatus("Ready");
-    } catch (e: any) {
-        console.error(e);
-        alert(`Render Error: ${e.message}`);
-    } finally {
-        setIsDownloading(false);
-    }
-  };
-
-  // Animation Loop for Preview
-  useEffect(() => {
-    if (isPlaying) {
-        const loop = () => {
-            const now = Date.now();
-            const elapsed = now - sceneStartTimeRef.current;
-            const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
-            let newProgress = (elapsed / sceneDur) * 100;
-
-            if (newProgress >= 100) {
-                if (currentSceneIndex < script.scenes.length - 1) {
-                    setCurrentSceneIndex(prev => prev + 1);
-                    setProgress(0);
-                    sceneStartTimeRef.current = Date.now();
-                    playSceneAudio(currentSceneIndex + 1);
-                } else {
-                    setIsPlaying(false);
-                    stopAudio();
-                }
-            } else {
-                setProgress(newProgress);
-                drawFrame(currentSceneIndex, newProgress);
-                timerRef.current = requestAnimationFrame(loop);
-            }
-        };
-        timerRef.current = requestAnimationFrame(loop);
-    } else {
-        drawFrame(currentSceneIndex, progress);
-    }
-  }, [isPlaying, currentSceneIndex, progress, assetsLoaded]);
 
   return (
     <div className="flex flex-col items-center justify-center w-full max-w-6xl mx-auto gap-8 lg:flex-row lg:items-start p-4">
@@ -441,13 +420,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         )}
 
         {isDownloading && (
-            <div className="absolute inset-0 bg-black/90 z-40 flex flex-col items-center justify-center p-6 text-center">
-                 <Loader2 className="animate-spin text-brand-500 mb-4" size={48} />
-                 <h3 className="text-xl font-bold text-white mb-2">Generating Video</h3>
-                 <p className="text-sm text-gray-300 font-mono">{loadingStatus}</p>
-                 <div className="w-full bg-gray-800 h-2 rounded-full mt-4 overflow-hidden">
-                    <div className="h-full bg-brand-500 animate-pulse w-full"></div>
-                 </div>
+            <div className="absolute top-4 right-4 z-40">
+                 <div className="bg-red-600 text-white text-xs font-bold px-2 py-1 rounded animate-pulse">REC</div>
             </div>
         )}
 
@@ -477,7 +451,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
               {isPlaying ? 'Pause' : 'Preview'}
             </button>
             <button 
-              onClick={handleRestart}
+              onClick={() => { stopAudio(); setIsPlaying(false); restartSequence(); setIsPlaying(false); }}
               disabled={isDownloading || !assetsLoaded}
               className="p-3 bg-gray-700 hover:bg-gray-600 rounded-xl disabled:opacity-50"
             >
@@ -492,7 +466,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           </div>
 
           <button 
-                onClick={startDownload}
+                onClick={startRecording}
                 disabled={isDownloading || !assetsLoaded}
                 className={`w-full bg-white text-black font-bold text-lg rounded-xl p-4 flex items-center justify-center gap-3 transition-all ${
                     isDownloading ? 'opacity-70 cursor-wait' : 'hover:bg-gray-100 shadow-xl shadow-white/10'
@@ -501,15 +475,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                {isDownloading ? (
                    <>
                     <Loader2 className="animate-spin" size={24} />
-                    Processing...
+                    Recording Video...
                    </>
                ) : (
                    <>
                     <Download size={24} />
-                    Download MP4 (1080p)
+                    Download Video (Native)
                    </>
                )}
           </button>
+          {isDownloading && <p className="text-center text-xs text-gray-400 mt-2">Please wait, recording the video in real-time to ensure quality.</p>}
         </div>
         <button onClick={onEditRequest} disabled={isDownloading} className="text-sm text-gray-500 hover:text-white underline w-full text-center">
           Create New Video
