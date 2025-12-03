@@ -1,9 +1,9 @@
-import { GoogleGenAI, Modality } from "@google/genai";
+iimport { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, MarketingGoal } from "../types";
 
 // --- API KEY MANAGER ---
 // USER PROVIDED KEY INJECTED FOR IMMEDIATE FIX
-const EMERGENCY_KEY = "AIzaSyC_Xye5mxdCgNvRjCL9XLKJXUF8z7XrUTI";
+const EMERGENCY_KEY = "AIzaSyBSEELLWDIa01iwsXLlGtNHg283oqSu65g";
 
 export const getApiKey = (): string => {
     let candidateKey = "";
