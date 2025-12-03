@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
-import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, AlertCircle } from 'lucide-react';
+import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2 } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
 
 interface VideoPlayerProps {
@@ -16,7 +16,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [isMuted, setIsMuted] = useState(false);
   const [assetsLoaded, setAssetsLoaded] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("Initializing...");
-  const [isDownloading, setIsDownloading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false); // New state for "Mixing"
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<number | null>(null);
@@ -43,11 +43,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         const ctx = new AudioContextClass();
         const masterGain = ctx.createGain();
         masterGain.gain.value = 1;
-        masterGain.connect(ctx.destination);
+        masterGain.connect(ctx.destination); // For hearing
         
-        // Create Destination for Recording
+        // Create Destination for Recording (The "Mixer")
         const dest = ctx.createMediaStreamDestination();
-        masterGain.connect(dest);
+        masterGain.connect(dest); // For recording
         destNodeRef.current = dest;
 
         audioCtxRef.current = ctx;
@@ -79,7 +79,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
           return await ctx.decodeAudioData(bytes.buffer);
       } catch (e) {
-          console.error("Audio decode error, using silence", e);
           return createSilentBuffer(ctx);
       }
   };
@@ -92,30 +91,26 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     audioBufferCache.current = {};
     
     const loadAssets = async () => {
-        setLoadingStatus("Downloading Assets...");
+        setLoadingStatus("Downloading Visuals...");
         
-        // 1. Load Images
+        // 1. Load Images (with Cache Busting to prevent Tainted Canvas)
         const imagePromises = script.scenes.map(async (scene, i) => {
-            setLoadingStatus(`Fetching Image ${i+1}...`);
             let imageUrl = '';
-            try {
-                imageUrl = await getStockImage(scene.imageKeyword);
-            } catch {
-                imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
-            }
+            try { imageUrl = await getStockImage(scene.imageKeyword); } 
+            catch { imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}/1080/1920`; }
 
             await new Promise<void>((resolve) => {
                 const img = new Image();
-                img.crossOrigin = "anonymous"; 
+                img.crossOrigin = "anonymous"; // CRITICAL FOR RECORDING
+                // Add timestamp to force fresh request and avoid cache tainting
                 const safeUrl = imageUrl.includes('?') 
                     ? `${imageUrl}&t=${Date.now()}` 
                     : `${imageUrl}?t=${Date.now()}`;
                 
                 img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
                 img.onerror = () => {
-                    img.src = `https://picsum.photos/seed/fallback_${i}/1080/1920?t=${Date.now()}`; 
-                    img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
-                    img.onerror = () => resolve(); 
+                    // Fallback to solid color if download fails
+                    resolve(); 
                 };
                 img.src = safeUrl;
             });
@@ -126,7 +121,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         // 2. Load Audio
         for (let i = 0; i < script.scenes.length; i++) {
             const scene = script.scenes[i];
-            setLoadingStatus(`Voice Synthesis ${i + 1}...`);
+            setLoadingStatus(`Synthesizing Voice ${i + 1}/${script.scenes.length}...`);
             try {
                 const base64Audio = await generateNarration(scene.narration);
                 if (audioCtxRef.current) {
@@ -171,57 +166,51 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     }
   };
 
-  const handlePlayPause = async () => {
-    if (audioCtxRef.current?.state === 'suspended') await audioCtxRef.current.resume();
-    if (isPlaying) {
-      setIsPlaying(false);
-      stopAudio();
-      if (timerRef.current) cancelAnimationFrame(timerRef.current);
-    } else {
-      setIsPlaying(true);
-      // Logic to continue or restart
-      if (currentSceneIndex >= script.scenes.length - 1 && progress >= 100) {
-        restartSequence();
-      } else {
-        const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
-        const elapsed = (progress / 100) * sceneDur;
-        sceneStartTimeRef.current = Date.now() - elapsed;
-        playSceneAudio(currentSceneIndex); 
-        runAnimationLoop();
-      }
-    }
-  };
-
-  const restartSequence = () => {
+  const startPlayback = (recordingMode = false) => {
+      // Reset
       setCurrentSceneIndex(0);
       setProgress(0);
       sceneStartTimeRef.current = Date.now();
-      playSceneAudio(0);
-      runAnimationLoop();
-  }
+      
+      // Ensure Audio Context is running (user interaction req)
+      if (audioCtxRef.current?.state === 'suspended') {
+          audioCtxRef.current.resume();
+      }
 
-  const runAnimationLoop = () => {
+      setIsPlaying(true);
+      if (recordingMode) setIsProcessing(true);
+      
+      playSceneAudio(0);
+      runAnimationLoop(recordingMode);
+  };
+
+  const runAnimationLoop = (recordingMode: boolean) => {
     const loop = () => {
         const now = Date.now();
         const elapsed = now - sceneStartTimeRef.current;
         const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
+        
         let newProgress = (elapsed / sceneDur) * 100;
 
+        // Ensure we draw the frame
+        drawFrame(currentSceneIndex, Math.min(newProgress, 100));
+
         if (newProgress >= 100) {
+            // Scene Finished
             if (currentSceneIndex < script.scenes.length - 1) {
                 // Next Scene
                 setCurrentSceneIndex(prev => {
                     const next = prev + 1;
                     sceneStartTimeRef.current = Date.now();
-                    playSceneAudio(next);
+                    playSceneAudio(next); // Play next audio
                     return next;
                 });
                 setProgress(0);
                 timerRef.current = requestAnimationFrame(loop);
             } else {
-                // End of video
-                if (isDownloading) {
-                    finishRecording(); // Stop recording if we are in download mode
+                // Video Finished
+                if (recordingMode) {
+                    finishRecording();
                 } else {
                     setIsPlaying(false);
                     stopAudio();
@@ -230,7 +219,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             }
         } else {
             setProgress(newProgress);
-            drawFrame(currentSceneIndex, newProgress);
             timerRef.current = requestAnimationFrame(loop);
         }
     };
@@ -243,49 +231,67 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (!canvas || !assetsLoaded) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    renderSceneToContext(ctx, canvas.width, canvas.height, sceneIndex, sceneProgressPercent);
-  };
-  
-  const renderSceneToContext = (ctx: CanvasRenderingContext2D, width: number, height: number, sceneIndex: number, progress: number) => {
-    const scene = script.scenes[sceneIndex];
+
+    // Safety check for index
+    const idx = Math.min(sceneIndex, script.scenes.length - 1);
+    const scene = script.scenes[idx];
     const img = imageCache.current[scene.id];
 
-    ctx.clearRect(0, 0, width, height);
+    // Clear
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Draw Image (Zoom Effect)
     if (img) {
-      const scale = 1 + (progress / 100) * 0.10; // Zoom effect
-      const scaledWidth = width * scale;
-      const scaledHeight = height * scale;
-      const x = (width - scaledWidth) / 2;
-      const y = (height - scaledHeight) / 2;
+      const scale = 1 + (sceneProgressPercent / 100) * 0.10; 
+      const scaledWidth = canvas.width * scale;
+      const scaledHeight = canvas.height * scale;
+      const x = (canvas.width - scaledWidth) / 2;
+      const y = (canvas.height - scaledHeight) / 2;
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
     } else {
-      ctx.fillStyle = '#111827';
-      ctx.fillRect(0, 0, width, height);
+        // Fallback Gradient if image missing
+        const grd = ctx.createLinearGradient(0, 0, 0, canvas.height);
+        grd.addColorStop(0, "#1e3a8a");
+        grd.addColorStop(1, "#000000");
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
     
-    // Overlay
+    // Dark Overlay
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-    ctx.fillRect(0, 0, width, height);
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Text - Burned In
+    // Draw Texts (Burn-in)
+    const w = canvas.width;
+    const h = canvas.height;
+
+    // Main Text (Center)
     ctx.save();
-    ctx.font = '900 60px Inter, sans-serif'; 
+    ctx.font = '900 56px Inter, sans-serif'; 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = 'white';
     ctx.shadowColor = 'black';
     ctx.shadowBlur = 20;
-    wrapText(ctx, scene.overlayText.toUpperCase(), width / 2, height / 2, width * 0.8, 75);
+    wrapText(ctx, scene.overlayText.toUpperCase(), w / 2, h / 2, w * 0.85, 70);
     ctx.restore();
 
-    // Subtitles
+    // Subtitles (Bottom)
     ctx.save();
-    ctx.font = 'bold 32px Inter, sans-serif';
+    ctx.font = 'bold 28px Inter, sans-serif';
     ctx.textAlign = 'center';
-    const narrY = height - 250;
-    wrapTextWithBg(ctx, scene.narration, width/2, narrY, width * 0.9, 45);
+    const narrY = h - 200;
+    wrapTextWithBg(ctx, scene.narration, w/2, narrY, w * 0.9, 40);
     ctx.restore();
+    
+    // Progress Bar (Visual indicator during recording)
+    if (isProcessing) {
+        ctx.fillStyle = '#ef4444'; // Red recording dot
+        ctx.beginPath();
+        ctx.arc(40, 40, 15, 0, 2 * Math.PI);
+        ctx.fill();
+    }
   }
 
   const wrapText = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number) => {
@@ -323,52 +329,36 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
      let curY = y;
      lines.forEach(l => {
          const w = ctx.measureText(l).width;
-         ctx.fillStyle = 'rgba(0,0,0,0.7)';
-         ctx.fillRect(x - w/2 - 10, curY - 30, w + 20, 40);
+         ctx.fillStyle = 'rgba(0,0,0,0.6)';
+         ctx.fillRect(x - w/2 - 10, curY - 26, w + 20, 34);
          ctx.fillStyle = '#fde047'; 
          ctx.fillText(l, x, curY);
          curY += lineHeight;
      });
   }
 
-  // --- NATIVE BROWSER RECORDING ---
-  const startRecording = async () => {
+  // --- RECORDING ---
+  const handleDownload = async () => {
       if (!canvasRef.current || !destNodeRef.current || !audioCtxRef.current) {
-          alert("Recording not supported on this browser.");
+          alert("Browser not supported.");
           return;
       }
 
-      setIsDownloading(true);
-      setLoadingStatus("Recording in real-time (Please wait)...");
-      setIsPlaying(true);
-      stopAudio(); // Reset state
+      // 1. Prepare
+      stopAudio();
+      setIsProcessing(true); // UI Lock
 
-      // 1. Capture Canvas Stream
+      // 2. Setup Stream (Canvas + Audio)
       const canvasStream = canvasRef.current.captureStream(30); // 30 FPS
-      
-      // 2. Capture Audio Stream
       const audioStream = destNodeRef.current.stream;
-      
-      // 3. Combine
       const combinedStream = new MediaStream([
           ...canvasStream.getVideoTracks(),
           ...audioStream.getAudioTracks()
       ]);
 
-      // 4. Start Recorder
-      // Try widely supported codecs
-      let mimeType = 'video/webm;codecs=vp9';
-      if (!MediaRecorder.isTypeSupported(mimeType)) {
-          mimeType = 'video/webm;codecs=vp8';
-          if (!MediaRecorder.isTypeSupported(mimeType)) {
-              mimeType = 'video/webm';
-          }
-      }
-
-      const recorder = new MediaRecorder(combinedStream, {
-          mimeType,
-          videoBitsPerSecond: 5000000 // 5 Mbps
-      });
+      // 3. Setup Recorder
+      const options = { mimeType: 'video/webm' }; // Most compatible
+      const recorder = new MediaRecorder(combinedStream, options);
 
       recordedChunksRef.current = [];
       recorder.ondataavailable = (e) => {
@@ -376,34 +366,34 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       };
 
       recorder.onstop = () => {
+          // Create File
           const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
           const url = URL.createObjectURL(blob);
+          
+          // Trigger Download
           const a = document.createElement('a');
           a.href = url;
-          a.download = `${script.title.replace(/\s+/g, '_')}_viralize.webm`;
+          a.download = `${script.title.replace(/\s+/g, '_')}_ViralizePro.webm`;
           document.body.appendChild(a);
           a.click();
           window.URL.revokeObjectURL(url);
-          setIsDownloading(false);
-          setLoadingStatus("Ready");
+          
+          // Cleanup
+          setIsProcessing(false);
           setIsPlaying(false);
       };
 
       mediaRecorderRef.current = recorder;
-      recorder.start();
 
-      // Start Playback Loop
-      restartSequence();
+      // 4. Start Everything
+      recorder.start();
+      startPlayback(true); // Start animation loop in recording mode
   };
 
   const finishRecording = () => {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
           mediaRecorderRef.current.stop();
           stopAudio();
-          // Ensure we stop tracks to release memory
-          if (mediaRecorderRef.current.stream) {
-              mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
-          }
       }
   };
 
@@ -419,10 +409,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
              </div>
         )}
 
-        {isDownloading && (
-            <div className="absolute top-4 right-4 z-40">
-                 <div className="bg-red-600 text-white text-xs font-bold px-2 py-1 rounded animate-pulse">REC</div>
-            </div>
+        {isProcessing && (
+             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-30 p-6 text-center backdrop-blur-sm">
+                 <div className="w-16 h-16 border-4 border-red-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                 <h3 className="text-xl font-bold text-white mb-2">Mixing & Recording...</h3>
+                 <p className="text-sm text-gray-300">Please wait while the video plays through to capture quality.</p>
+                 <p className="text-xs text-gray-500 mt-4 font-mono">Do not switch tabs</p>
+             </div>
         )}
 
         <canvas ref={canvasRef} width={540} height={960} className="w-full h-full object-cover bg-gray-900"/>
@@ -441,18 +434,18 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
           <div className="flex gap-4 mb-8">
             <button 
-              onClick={handlePlayPause}
-              disabled={isDownloading || !assetsLoaded}
+              onClick={() => startPlayback(false)}
+              disabled={isProcessing || !assetsLoaded}
               className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-xl font-semibold transition-all shadow-lg ${
-                isPlaying ? 'bg-gray-700' : 'bg-brand-600 hover:bg-brand-500'
+                isPlaying && !isProcessing ? 'bg-gray-700' : 'bg-brand-600 hover:bg-brand-500'
               } disabled:opacity-50`}
             >
-              {isPlaying ? <Pause size={20} /> : <Play size={20} />}
-              {isPlaying ? 'Pause' : 'Preview'}
+              {isPlaying && !isProcessing ? <Pause size={20} /> : <Play size={20} />}
+              {isPlaying && !isProcessing ? 'Pause Preview' : 'Play Preview'}
             </button>
             <button 
-              onClick={() => { stopAudio(); setIsPlaying(false); restartSequence(); setIsPlaying(false); }}
-              disabled={isDownloading || !assetsLoaded}
+              onClick={() => { stopAudio(); setIsPlaying(false); drawFrame(0,0); }}
+              disabled={isProcessing || !assetsLoaded}
               className="p-3 bg-gray-700 hover:bg-gray-600 rounded-xl disabled:opacity-50"
             >
               <RotateCcw size={20} />
@@ -466,27 +459,29 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           </div>
 
           <button 
-                onClick={startRecording}
-                disabled={isDownloading || !assetsLoaded}
+                onClick={handleDownload}
+                disabled={isProcessing || !assetsLoaded}
                 className={`w-full bg-white text-black font-bold text-lg rounded-xl p-4 flex items-center justify-center gap-3 transition-all ${
-                    isDownloading ? 'opacity-70 cursor-wait' : 'hover:bg-gray-100 shadow-xl shadow-white/10'
+                    isProcessing ? 'opacity-70 cursor-wait' : 'hover:bg-gray-100 shadow-xl shadow-white/10'
                 }`}
              >
-               {isDownloading ? (
+               {isProcessing ? (
                    <>
-                    <Loader2 className="animate-spin" size={24} />
-                    Recording Video...
+                    <Loader2 className="animate-spin text-red-600" size={24} />
+                    Processing Video (Mixing)...
                    </>
                ) : (
                    <>
                     <Download size={24} />
-                    Download Video (Native)
+                    Mix & Download Video
                    </>
                )}
           </button>
-          {isDownloading && <p className="text-center text-xs text-gray-400 mt-2">Please wait, recording the video in real-time to ensure quality.</p>}
+          <p className="text-center text-xs text-gray-500 mt-2">
+            Uses native browser recording. 100% Free. No Engine Errors.
+          </p>
         </div>
-        <button onClick={onEditRequest} disabled={isDownloading} className="text-sm text-gray-500 hover:text-white underline w-full text-center">
+        <button onClick={onEditRequest} disabled={isProcessing} className="text-sm text-gray-500 hover:text-white underline w-full text-center">
           Create New Video
         </button>
       </div>
