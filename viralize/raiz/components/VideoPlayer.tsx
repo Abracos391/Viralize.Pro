@@ -16,7 +16,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [isMuted, setIsMuted] = useState(false);
   const [assetsLoaded, setAssetsLoaded] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("Initializing...");
-  const [isProcessing, setIsProcessing] = useState(false); // New state for "Mixing"
+  const [isProcessing, setIsProcessing] = useState(false); 
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const timerRef = useRef<number | null>(null);
@@ -357,7 +357,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       ]);
 
       // 3. Setup Recorder
-      const options = { mimeType: 'video/webm' }; // Most compatible
+      // Try high quality codecs if available
+      let options = { mimeType: 'video/webm' };
+      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')) {
+          options = { mimeType: 'video/webm;codecs=vp9,opus' };
+      } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')) {
+          options = { mimeType: 'video/webm;codecs=vp8,opus' };
+      }
+
       const recorder = new MediaRecorder(combinedStream, options);
 
       recordedChunksRef.current = [];
