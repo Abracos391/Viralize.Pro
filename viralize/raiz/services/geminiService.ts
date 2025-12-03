@@ -6,19 +6,35 @@ import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, Mark
 const EMERGENCY_KEY = "AIzaSyC_Xye5mxdCgNvRjCL9XLKJXUF8z7XrUTI";
 
 export const getApiKey = (): string => {
+    let candidateKey = "";
+
     // 1. Check Environment Variable (Build time / Render)
     const envKey = process.env.API_KEY;
     if (envKey && envKey.length > 10 && envKey !== 'undefined') {
-        return envKey;
-    }
-    // 2. Check Browser Storage (Runtime)
-    if (typeof window !== 'undefined') {
-        const localKey = localStorage.getItem('GEMINI_API_KEY');
-        if (localKey && localKey.length > 10) return localKey;
+        candidateKey = envKey;
     }
     
-    // 3. Fallback to Emergency Key provided by user
-    return EMERGENCY_KEY;
+    // 2. Check Browser Storage (Runtime) - Overrides Env if present
+    if (typeof window !== 'undefined') {
+        const localKey = localStorage.getItem('GEMINI_API_KEY');
+        if (localKey && localKey.length > 10) {
+            candidateKey = localKey;
+        }
+    }
+
+    // 3. VALIDATION: Google Keys MUST start with "AIza"
+    // This prevents users from accidentally pasting Supabase/JWT keys (starting with eyJ...)
+    if (candidateKey && candidateKey.startsWith("AIza")) {
+        return candidateKey;
+    }
+    
+    // 4. Fallback to Emergency Key provided by user
+    // Only use if it looks valid
+    if (EMERGENCY_KEY.startsWith("AIza")) {
+        return EMERGENCY_KEY;
+    }
+
+    return "";
 };
 
 export const setRuntimeApiKey = (key: string) => {
@@ -30,7 +46,7 @@ export const setRuntimeApiKey = (key: string) => {
 
 export const hasValidKey = (): boolean => {
     const key = getApiKey();
-    return key.length > 10;
+    return key.length > 10 && key.startsWith("AIza");
 };
 
 // --- MOCK DATA FOR DEMO MODE (NO API KEY) ---
