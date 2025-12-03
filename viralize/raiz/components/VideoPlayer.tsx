@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, Music4, AlertTriangle } from 'lucide-react';
-import { generateNarration, getStockImage } from '../services/geminiService';
+import { generateNarration, getStockImage, generateMockAudioBase64 } from '../services/geminiService';
 import { renderVideoWithFFmpeg } from '../services/ffmpegService';
 
 interface VideoPlayerProps {
@@ -119,8 +119,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
                 let success = false;
+                let attempts = 0;
+                const MAX_SCENE_RETRIES = 3;
                 
-                while (!success) {
+                while (!success && attempts < MAX_SCENE_RETRIES) {
                     setLoadingStatus(`Synthesizing Audio ${i + 1}/${script.scenes.length}...`);
                     
                     try {
@@ -136,8 +138,20 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                             throw new Error("Empty audio");
                         }
                     } catch (e) {
-                        setLoadingStatus(`Waiting for Google API (Scene ${i+1})...`);
-                        await new Promise(r => setTimeout(r, 5000));
+                        attempts++;
+                        if (attempts >= MAX_SCENE_RETRIES) {
+                             console.warn(`Failed to generate audio for scene ${i+1} after ${attempts} attempts. Using fallback.`);
+                             // Fallback to mock audio to prevent infinite loop
+                             if (audioCtxRef.current) {
+                                 const mockB64 = generateMockAudioBase64();
+                                 const buffer = await decodeAudio(mockB64, audioCtxRef.current);
+                                 audioBufferCache.current[scene.id] = buffer;
+                                 success = true;
+                             }
+                        } else {
+                            setLoadingStatus(`Retry ${attempts}/${MAX_SCENE_RETRIES} (Scene ${i+1})...`);
+                            await new Promise(r => setTimeout(r, 2000));
+                        }
                     }
                 }
             }
