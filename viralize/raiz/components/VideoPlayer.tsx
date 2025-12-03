@@ -25,13 +25,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   
   // Asset Caches
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
-  const imageBinaryCache = useRef<Record<number, Uint8Array>>({});
-  
   const audioBufferCache = useRef<Record<number, AudioBuffer>>({});
+  
   const audioCtxRef = useRef<AudioContext | null>(null); 
   const masterGainRef = useRef<GainNode | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
+  // Init Audio Context Safely
   useEffect(() => {
     try {
         const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
@@ -52,10 +52,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
+  // --- AUDIO HELPERS ---
   const createSilentBuffer = (ctx: AudioContext | null, duration: number = 2.0): AudioBuffer => {
-      // Fallback object if ctx is null (SSR/No Audio)
       const rate = ctx ? ctx.sampleRate : 44100;
-      const len = rate * duration;
+      const len = Math.ceil(rate * duration);
       const buf = ctx ? ctx.createBuffer(1, len, rate) : new AudioBuffer({length: len, sampleRate: rate, numberOfChannels: 1});
       return buf;
   };
@@ -74,26 +74,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       }
   };
 
-  const fetchImageAsBinary = async (url: string): Promise<Uint8Array> => {
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error("Image fetch failed");
-      const buffer = await resp.arrayBuffer();
-      return new Uint8Array(buffer);
-  };
-
+  // --- ASSET LOADING ---
   useEffect(() => {
     setAssetsLoaded(false);
     setIsPlaying(false);
     imageCache.current = {};
-    imageBinaryCache.current = {};
     audioBufferCache.current = {};
     
     const loadAssets = async () => {
         setLoadingStatus("Downloading Assets...");
         
-        // 1. Load Images
+        // 1. Load Images (as HTMLImageElements)
         const imagePromises = script.scenes.map(async (scene, i) => {
-            setLoadingStatus(`Getting Image ${i+1}...`);
+            setLoadingStatus(`Fetching Image ${i+1}...`);
             let imageUrl = '';
             try {
                 imageUrl = await getStockImage(scene.imageKeyword);
@@ -101,30 +94,25 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
             }
 
-            let binaryData: Uint8Array | null = null;
-            try {
-                binaryData = await fetchImageAsBinary(imageUrl);
-            } catch (e) {
-                try {
-                     binaryData = await fetchImageAsBinary(`https://picsum.photos/seed/fallback/1080/1920`);
-                } catch {
-                     console.error("Critical image failure for scene", i);
-                     return; 
-                }
-            }
-
-            if (binaryData) {
-                imageBinaryCache.current[scene.id] = binaryData;
-                const blob = new Blob([binaryData]);
-                const objectUrl = URL.createObjectURL(blob);
+            await new Promise<void>((resolve) => {
+                const img = new Image();
+                img.crossOrigin = "anonymous"; // CRITICAL FOR CANVAS EXPORT
                 
-                await new Promise<void>((resolve) => {
-                    const img = new Image();
+                // CACHE BUSTING: KEY ELEMENT FOR FIXING TAINTED CANVAS
+                // Appending time ensures we get a fresh image with correct CORS headers
+                const safeUrl = imageUrl.includes('?') 
+                    ? `${imageUrl}&t=${Date.now()}` 
+                    : `${imageUrl}?t=${Date.now()}`;
+                
+                img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
+                img.onerror = () => {
+                    // Retry once with placeholder to guarantee visual
+                    img.src = `https://picsum.photos/seed/fallback_${i}/1080/1920?t=${Date.now()}`; 
                     img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
-                    img.onerror = () => resolve(); 
-                    img.src = objectUrl;
-                });
-            }
+                    img.onerror = () => resolve(); // Give up, preProcess will handle missing
+                };
+                img.src = safeUrl;
+            });
         });
 
         await Promise.allSettled(imagePromises);
@@ -132,7 +120,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         // 2. Load Audio
         for (let i = 0; i < script.scenes.length; i++) {
             const scene = script.scenes[i];
-            setLoadingStatus(`Synthesizing Voice ${i + 1}...`);
+            setLoadingStatus(`Voice Synthesis ${i + 1}...`);
             try {
                 const base64Audio = await generateNarration(scene.narration);
                 if (audioCtxRef.current) {
@@ -155,6 +143,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     return () => { stopAudio(); if (timerRef.current) cancelAnimationFrame(timerRef.current); };
   }, [script]);
 
+  // --- PLAYBACK LOGIC ---
   const stopAudio = () => {
     if (activeSourceRef.current) {
         try { activeSourceRef.current.stop(); } catch(e) {}
@@ -207,32 +196,40 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     setTimeout(() => drawFrame(0, 0), 0);
   };
 
+  // --- CANVAS DRAWING (USED FOR PREVIEW AND EXPORT) ---
   const drawFrame = (sceneIndex: number, sceneProgressPercent: number) => {
     const canvas = canvasRef.current;
     if (!canvas || !assetsLoaded) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const width = canvas.width;
-    const height = canvas.height;
+    renderSceneToContext(ctx, canvas.width, canvas.height, sceneIndex, sceneProgressPercent);
+  };
+  
+  const renderSceneToContext = (ctx: CanvasRenderingContext2D, width: number, height: number, sceneIndex: number, progress: number) => {
     const scene = script.scenes[sceneIndex];
     const img = imageCache.current[scene.id];
 
     ctx.clearRect(0, 0, width, height);
 
+    // 1. Draw Image
     if (img) {
-      const scale = 1 + (sceneProgressPercent / 100) * 0.15; 
+      const scale = 1 + (progress / 100) * 0.10; 
       const scaledWidth = width * scale;
       const scaledHeight = height * scale;
       const x = (width - scaledWidth) / 2;
       const y = (height - scaledHeight) / 2;
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
     } else {
-      ctx.fillStyle = '#1f2937';
+      // Fallback for missing image - Draw colored background
+      ctx.fillStyle = sceneIndex % 2 === 0 ? '#1f2937' : '#111827';
       ctx.fillRect(0, 0, width, height);
     }
+    
+    // 2. Overlay Darken
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
     ctx.fillRect(0, 0, width, height);
 
+    // 3. Text Drawing (Burned In)
     ctx.save();
     ctx.font = '900 60px Inter, sans-serif'; 
     ctx.textAlign = 'center';
@@ -243,13 +240,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     wrapText(ctx, scene.overlayText.toUpperCase(), width / 2, height / 2, width * 0.8, 75);
     ctx.restore();
 
+    // Narration Subtitles
     ctx.save();
     ctx.font = 'bold 32px Inter, sans-serif';
     ctx.textAlign = 'center';
-    const narrY = height - 200;
+    const narrY = height - 250;
     wrapTextWithBg(ctx, scene.narration, width/2, narrY, width * 0.9, 45);
     ctx.restore();
-  };
+  }
 
   const wrapText = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number) => {
     const words = text.split(' ');
@@ -288,19 +286,63 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
          const w = ctx.measureText(l).width;
          ctx.fillStyle = 'rgba(0,0,0,0.7)';
          ctx.fillRect(x - w/2 - 10, curY - 30, w + 20, 40);
-         ctx.fillStyle = '#fde047';
+         ctx.fillStyle = '#fde047'; 
          ctx.fillText(l, x, curY);
          curY += lineHeight;
      });
   }
 
-  // --- AUDIO STITCHING ---
+  // --- GENERATE PRE-PROCESSED IMAGES FOR FFMPEG ---
+  const preProcessImages = async (): Promise<Record<number, Uint8Array>> => {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 1080;
+      offCanvas.height = 1920;
+      const ctx = offCanvas.getContext('2d');
+      if(!ctx) throw new Error("Canvas init failed");
+
+      const processed: Record<number, Uint8Array> = {};
+
+      for (const scene of script.scenes) {
+          try {
+             // We use a fresh context drawing for each scene
+             renderSceneToContext(ctx, 1080, 1920, script.scenes.indexOf(scene), 0);
+             
+             // Convert to Blob
+             const blob = await new Promise<Blob | null>(r => offCanvas.toBlob(r, 'image/jpeg', 0.9));
+             
+             if (blob) {
+                  const buf = await blob.arrayBuffer();
+                  processed[scene.id] = new Uint8Array(buf);
+             } else {
+                 throw new Error("Tainted Canvas or null blob");
+             }
+          } catch (e) {
+             console.error(`Failed to process scene ${scene.id}, using safety fallback`, e);
+             // Safety Fallback: Draw simple color background with text
+             ctx.fillStyle = '#374151';
+             ctx.fillRect(0,0,1080,1920);
+             ctx.fillStyle = 'white';
+             ctx.font = '50px sans-serif';
+             ctx.fillText(scene.overlayText, 100, 960);
+             
+             const fallbackBlob = await new Promise<Blob | null>(r => offCanvas.toBlob(r, 'image/jpeg', 0.8));
+             if(fallbackBlob) {
+                 const buf = await fallbackBlob.arrayBuffer();
+                 processed[scene.id] = new Uint8Array(buf);
+             }
+          }
+      }
+      return processed;
+  }
+
+  // --- AUDIO STITCHING (STEREO) ---
   const stitchAudioBuffers = async (scenes: typeof script.scenes, buffers: Record<number, AudioBuffer>): Promise<Uint8Array> => {
       const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
-      const sampleRate = 48000; 
+      const sampleRate = 44100; 
       
       const OfflineCtx = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
-      const offlineCtx = new OfflineCtx(1, Math.ceil(totalDuration * sampleRate), sampleRate);
+      // Use 2 channels for Stereo output compat
+      const offlineCtx = new OfflineCtx(2, Math.ceil(totalDuration * sampleRate), sampleRate);
       
       let currentTime = 0;
       for (const scene of scenes) {
@@ -324,24 +366,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     stopAudio();
 
     try {
+        setLoadingStatus("Processing Visuals...");
+        const processedImages = await preProcessImages();
+
         setLoadingStatus("Mixing Audio...");
-        // Generate Master Audio
         const masterAudioWav = await stitchAudioBuffers(script.scenes, audioBufferCache.current);
         
-        // Prepare Images
-        const safeImagesBinary: Record<number, Uint8Array> = {};
-        for(const scene of script.scenes) {
-            if (imageBinaryCache.current[scene.id]) {
-                safeImagesBinary[scene.id] = imageBinaryCache.current[scene.id];
-            } else {
-                throw new Error("Missing image data");
-            }
-        }
-
         // Render
         const videoBlob = await renderVideoWithFFmpeg(
             script,
-            safeImagesBinary,
+            processedImages,
             masterAudioWav,
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
@@ -363,6 +397,37 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     }
   };
 
+  // Animation Loop for Preview
+  useEffect(() => {
+    if (isPlaying) {
+        const loop = () => {
+            const now = Date.now();
+            const elapsed = now - sceneStartTimeRef.current;
+            const sceneDur = script.scenes[currentSceneIndex].duration * 1000;
+            let newProgress = (elapsed / sceneDur) * 100;
+
+            if (newProgress >= 100) {
+                if (currentSceneIndex < script.scenes.length - 1) {
+                    setCurrentSceneIndex(prev => prev + 1);
+                    setProgress(0);
+                    sceneStartTimeRef.current = Date.now();
+                    playSceneAudio(currentSceneIndex + 1);
+                } else {
+                    setIsPlaying(false);
+                    stopAudio();
+                }
+            } else {
+                setProgress(newProgress);
+                drawFrame(currentSceneIndex, newProgress);
+                timerRef.current = requestAnimationFrame(loop);
+            }
+        };
+        timerRef.current = requestAnimationFrame(loop);
+    } else {
+        drawFrame(currentSceneIndex, progress);
+    }
+  }, [isPlaying, currentSceneIndex, progress, assetsLoaded]);
+
   return (
     <div className="flex flex-col items-center justify-center w-full max-w-6xl mx-auto gap-8 lg:flex-row lg:items-start p-4">
       <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-[3rem] border-[8px] border-gray-800 shadow-2xl overflow-hidden ring-1 ring-gray-700">
@@ -378,7 +443,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         {isDownloading && (
             <div className="absolute inset-0 bg-black/90 z-40 flex flex-col items-center justify-center p-6 text-center">
                  <Loader2 className="animate-spin text-brand-500 mb-4" size={48} />
-                 <h3 className="text-xl font-bold text-white mb-2">Rendering Video</h3>
+                 <h3 className="text-xl font-bold text-white mb-2">Generating Video</h3>
                  <p className="text-sm text-gray-300 font-mono">{loadingStatus}</p>
                  <div className="w-full bg-gray-800 h-2 rounded-full mt-4 overflow-hidden">
                     <div className="h-full bg-brand-500 animate-pulse w-full"></div>
