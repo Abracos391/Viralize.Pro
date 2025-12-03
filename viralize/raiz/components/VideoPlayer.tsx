@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Download, Loader2, Music4, AlertTriangle } from 'lucide-react';
-import { generateNarration, getStockImage, generateMockAudioBase64 } from '../services/geminiService';
+import { generateNarration, getStockImage } from '../services/geminiService';
 import { renderVideoWithFFmpeg } from '../services/ffmpegService';
 
 interface VideoPlayerProps {
@@ -58,14 +58,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
+  // SAFE SILENT BUFFER GENERATOR
+  // Replaces the broken Base64 method which caused crashes
+  const createSilentBuffer = (ctx: AudioContext): AudioBuffer => {
+      // Create a 1-second silent buffer
+      return ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+  };
+
   const decodeAudio = async (base64: string, ctx: AudioContext): Promise<AudioBuffer> => {
-      const binaryString = atob(base64);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      try {
+          const binaryString = atob(base64);
+          const len = binaryString.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+          }
+          // Decode can fail if data is corrupt/empty
+          return await ctx.decodeAudioData(bytes.buffer);
+      } catch (e) {
+          console.warn("Audio decoding failed, fallback to silence", e);
+          return createSilentBuffer(ctx);
       }
-      return await ctx.decodeAudioData(bytes.buffer);
   };
 
   useEffect(() => {
@@ -79,57 +92,76 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         try {
             setLoadingStatus("Analyzing visuals...");
             
-            // 1. Load Images (Parallel-ish)
+            // 1. Load Images with STRICT TIMEOUT
+            // Prevents app from hanging if an image URL is bad
             const imagePromises = script.scenes.map(async (scene, i) => {
                  setLoadingStatus(`Fetching Image ${i+1}...`);
-                 const imageUrl = await getStockImage(scene.imageKeyword);
+                 
+                 let imageUrl = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`; // Default fallback
+                 try {
+                     const stockUrl = await getStockImage(scene.imageKeyword);
+                     if (stockUrl) imageUrl = stockUrl;
+                 } catch (e) {
+                     console.warn("Stock image fetch failed", e);
+                 }
+
                  imageUrlCache.current[scene.id] = imageUrl;
                  
                  return new Promise<void>((resolve) => {
                     const img = new Image();
                     img.crossOrigin = "Anonymous"; 
-                    img.src = imageUrl;
-                    img.onload = () => { imageCache.current[scene.id] = img; resolve(); };
-                    img.onerror = () => {
-                        const fallback = `https://picsum.photos/seed/${scene.imageKeyword}-${scene.id}/1080/1920`;
-                        img.src = fallback;
-                        imageUrlCache.current[scene.id] = fallback;
-                        resolve(); // Resolve even on error to keep moving
+                    
+                    const timeout = setTimeout(() => {
+                        console.warn(`Image load timeout for scene ${i}`);
+                        img.src = ""; // Cancel load
+                        resolve(); // Resolve anyway to not block app
+                    }, 5000);
+
+                    img.onload = () => { 
+                        clearTimeout(timeout);
+                        imageCache.current[scene.id] = img; 
+                        resolve(); 
                     };
+                    img.onerror = () => {
+                        clearTimeout(timeout);
+                        console.warn(`Image failed to load for scene ${i}`);
+                        resolve(); // Resolve anyway
+                    };
+                    
+                    img.src = imageUrl;
                  });
             });
             await Promise.all(imagePromises);
 
-            // 2. Load Audio (Sequential to avoid API rate limits, but with fast failover)
+            // 2. Load Audio with FALLBACK TO SILENCE
             for (let i = 0; i < script.scenes.length; i++) {
                 const scene = script.scenes[i];
                 setLoadingStatus(`Synthesizing Voice ${i + 1}/${script.scenes.length}...`);
                 
-                try {
-                    // This now has a strict 8s timeout from geminiService
-                    const base64Audio = await generateNarration(scene.narration);
-                    
-                    if (audioCtxRef.current) {
+                if (audioCtxRef.current) {
+                    try {
+                        // Attempt generation
+                        const base64Audio = await generateNarration(scene.narration);
                         const buffer = await decodeAudio(base64Audio, audioCtxRef.current);
                         audioBufferCache.current[scene.id] = buffer;
+                    } catch (e) {
+                         console.warn(`Audio generation/decoding failed for scene ${i+1}. Using silence.`);
+                         // 100% Safe Fallback
+                         audioBufferCache.current[scene.id] = createSilentBuffer(audioCtxRef.current);
                     }
-                } catch (e) {
-                     console.warn(`Audio failed for scene ${i+1}, using silence.`);
-                     if (audioCtxRef.current) {
-                         const mockB64 = generateMockAudioBase64();
-                         const buffer = await decodeAudio(mockB64, audioCtxRef.current);
-                         audioBufferCache.current[scene.id] = buffer;
-                     }
                 }
             }
 
             setAssetsLoaded(true);
             setLoadingStatus("Ready");
-            drawFrame(0, 0); 
+            // Initial draw
+            setTimeout(() => drawFrame(0, 0), 100);
 
-        } catch (e) {
-            console.error(e);
-            setLoadingStatus("Error initializing assets. Refresh page.");
+        } catch (e: any) {
+            console.error("FATAL ASSET ERROR:", e);
+            setLoadingStatus(`Error: ${e.message || "Initialization failed"}`);
+            // Even on fatal error, try to let user proceed with what we have
+            setAssetsLoaded(true); 
         }
     };
 
@@ -219,8 +251,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       const y = (height - scaledHeight) / 2;
       ctx.drawImage(img, x, y, scaledWidth, scaledHeight);
     } else {
-      ctx.fillStyle = '#111';
+      // Fallback if image failed to load
+      ctx.fillStyle = '#1f2937';
       ctx.fillRect(0, 0, width, height);
+      ctx.fillStyle = '#374151';
+      ctx.textAlign = 'center';
+      ctx.fillText("Image Unavailable", width/2, height/2);
     }
 
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
@@ -343,10 +379,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     try {
         setLoadingStatus("Initializing Video Engine...");
         
+        // Ensure we pass SAFE AudioBuffers (no undefined)
+        // If an audio buffer is missing, generate silence on the fly
+        const safeAudioBuffers: Record<number, AudioBuffer> = {};
+        for(const scene of script.scenes) {
+            if(audioBufferCache.current[scene.id]) {
+                safeAudioBuffers[scene.id] = audioBufferCache.current[scene.id];
+            } else if (audioCtxRef.current) {
+                safeAudioBuffers[scene.id] = createSilentBuffer(audioCtxRef.current);
+            }
+        }
+
         const videoBlob = await renderVideoWithFFmpeg(
             script,
             imageUrlCache.current,
-            audioBufferCache.current,
+            safeAudioBuffers,
             (percent, msg) => setLoadingStatus(`${msg} (${Math.round(percent)}%)`)
         );
 
