@@ -1,4 +1,4 @@
-iimport { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, MarketingGoal } from "../types";
 
 // --- API KEY MANAGER ---
