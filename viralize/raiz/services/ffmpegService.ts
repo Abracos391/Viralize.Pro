@@ -42,7 +42,7 @@ export const loadFFmpeg = async (onLog?: (msg: string) => void): Promise<FFmpeg>
 };
 
 // --- FIXED WAV ENCODER ---
-function audioBufferToWav(buffer: AudioBuffer): Uint8Array {
+export function audioBufferToWav(buffer: AudioBuffer): Uint8Array {
     const numChannels = buffer.numberOfChannels;
     const sampleRate = buffer.sampleRate;
     const format = 1; // PCM
@@ -97,7 +97,7 @@ function audioBufferToWav(buffer: AudioBuffer): Uint8Array {
 export const renderVideoWithFFmpeg = async (
     script: GeneratedScript, 
     images: Record<number, Uint8Array>,
-    audioBuffers: Record<number, AudioBuffer>,
+    masterAudioWav: Uint8Array,
     onProgress: (p: number, msg: string) => void
 ): Promise<Blob> => {
     const ff = await loadFFmpeg((msg) => { if (msg.includes('frame=')) onProgress(60, "Rendering..."); });
@@ -109,9 +109,9 @@ export const renderVideoWithFFmpeg = async (
 
     onProgress(20, "Writing assets...");
     const imageFiles: string[] = [];
-    const audioFiles: string[] = [];
 
     await ff.writeFile('subtitles.srt', generateSubtitleFile(script));
+    await ff.writeFile('master_audio.wav', masterAudioWav);
 
     for (let i = 0; i < script.scenes.length; i++) {
         const scene = script.scenes[i];
@@ -120,42 +120,31 @@ export const renderVideoWithFFmpeg = async (
         const imgName = `img${i}.jpg`;
         await ff.writeFile(imgName, images[scene.id]);
         imageFiles.push(imgName);
-
-        // Write Audio (Fixing Silence Issue)
-        const audioName = `audio${i}.wav`;
-        const buffer = audioBuffers[scene.id];
-        // Ensure we have a valid buffer even if empty
-        const validBuffer = buffer || new AudioBuffer({length: 44100, sampleRate: 44100, numberOfChannels: 1});
-        const wavBytes = audioBufferToWav(validBuffer);
-        await ff.writeFile(audioName, wavBytes);
-        audioFiles.push(audioName);
     }
 
     onProgress(30, "Configuring Filters...");
     let inputArgs: string[] = [];
-    let filterComplex = "";
     let concatVideo = "";
-    let concatAudio = "";
-
-    // Inputs
+    
+    // Inputs (Images first)
     script.scenes.forEach((s, i) => inputArgs.push('-loop', '1', '-t', s.duration.toString(), '-i', imageFiles[i]));
-    script.scenes.forEach((_, i) => inputArgs.push('-i', audioFiles[i]));
+    
+    // Input (Master Audio - Last Input)
+    const audioInputIndex = script.scenes.length;
+    inputArgs.push('-i', 'master_audio.wav');
 
     const N = script.scenes.length;
 
     for (let i = 0; i < N; i++) {
         // Video: Scale & Crop
-        filterComplex += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}];`;
-        concatVideo += `[v${i}]`;
-
-        // Audio: Pad & Trim to match video duration exactly
-        const d = script.scenes[i].duration;
-        filterComplex += `[${N+i}:a]apad,atrim=0:${d}[a${i}];`;
-        concatAudio += `[a${i}]`;
+        concatVideo += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}];`;
     }
 
-    filterComplex += `${concatVideo}concat=n=${N}:v=1:a=0[vbase];`;
-    filterComplex += `${concatAudio}concat=n=${N}:v=0:a=1[abase];`;
+    // Simple Video Concat
+    let filterComplex = concatVideo;
+    let videoStreamMap = "";
+    for(let i=0; i<N; i++) videoStreamMap += `[v${i}]`;
+    filterComplex += `${videoStreamMap}concat=n=${N}:v=1:a=0[vbase];`;
     
     // Subtitles
     const style = `Fontname=Roboto,Fontsize=24,PrimaryColour=&H00FFFF,BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=100`;
@@ -168,15 +157,15 @@ export const renderVideoWithFFmpeg = async (
     await ff.exec([
         ...inputArgs,
         '-filter_complex', filterComplex,
-        '-map', '[vfinal]',
-        '-map', '[abase]',
+        '-map', '[vfinal]',       // Mapped Video with Subs
+        '-map', `${audioInputIndex}:a`, // Map the Master Audio file directly
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
+        '-c:a', 'aac',            // Convert WAV to AAC
         '-b:a', '192k',
         '-r', '30',
-        '-shortest',
+        '-shortest',              // Stop when shortest stream ends
         outputName
     ]);
 
