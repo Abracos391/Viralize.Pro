@@ -1,6 +1,49 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult, MarketingGoal } from "../types";
 
+// --- API KEY MANAGER ---
+export const getApiKey = (): string => {
+    // 1. Check Environment Variable (Build time / Render)
+    const envKey = process.env.API_KEY;
+    if (envKey && envKey.length > 10 && envKey !== 'undefined') {
+        return envKey;
+    }
+    // 2. Check Browser Storage (Runtime)
+    if (typeof window !== 'undefined') {
+        return localStorage.getItem('GEMINI_API_KEY') || '';
+    }
+    return '';
+};
+
+export const setRuntimeApiKey = (key: string) => {
+    if (typeof window !== 'undefined') {
+        localStorage.setItem('GEMINI_API_KEY', key);
+        window.location.reload();
+    }
+};
+
+export const hasValidKey = (): boolean => {
+    const key = getApiKey();
+    return key.length > 10;
+};
+
+// --- MOCK DATA FOR DEMO MODE (NO API KEY) ---
+const MOCK_SCRIPT: GeneratedScript = {
+    title: "Demo Video (No API Key)",
+    tone: "Professional",
+    seoKeywords: ["demo", "test", "viralize"],
+    hashtags: ["#demo", "#viralizepro"],
+    estimatedViralScore: 85,
+    scenes: [
+        { id: 1, duration: 2.5, narration: "Welcome to Viralize Pro demo mode.", overlayText: "VIRALIZE PRO DEMO", imageKeyword: "technology", isCta: false },
+        { id: 2, duration: 2.5, narration: "We create videos without API keys.", overlayText: "NO KEYS NEEDED", imageKeyword: "coding", isCta: false },
+        { id: 3, duration: 2.5, narration: "Using FFmpeg inside the browser.", overlayText: "BROWSER POWER", imageKeyword: "laptop", isCta: false },
+        { id: 4, duration: 2.5, narration: "Fast rendering with WebAssembly.", overlayText: "FAST RENDER", imageKeyword: "rocket", isCta: false },
+        { id: 5, duration: 2.5, narration: "Download your video instantly.", overlayText: "DOWNLOAD NOW", imageKeyword: "download", isCta: true },
+        { id: 6, duration: 2.5, narration: "Click the link to start today.", overlayText: "LINK IN BIO", imageKeyword: "success", isCta: true }
+    ]
+};
+
 // --- CACHE UTILS ---
 const hashCode = (s: string) => {
     let h = 0, l = s.length, i = 0;
@@ -43,7 +86,11 @@ const parseJSON = (text: string) => {
 // --- COMPLIANCE & TRENDS AI ---
 
 export const validateContentSafety = async (product: string, description: string): Promise<ComplianceResult> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const apiKey = getApiKey();
+    // BYPASS: If no key, assume safe for demo purposes
+    if (!apiKey) return { isSafe: true, flaggedCategories: [], reason: "Demo Mode", suggestion: "" };
+
+    const ai = new GoogleGenAI({ apiKey });
     
     const prompt = `
     ACT AS A SOCIAL MEDIA COMPLIANCE OFFICER (TikTok, Meta, YouTube).
@@ -75,13 +122,16 @@ export const validateContentSafety = async (product: string, description: string
         });
         return parseJSON(response.text) as ComplianceResult;
     } catch (e) {
-        // Fail open but warn
         return { isSafe: true, flaggedCategories: [], reason: "AI check failed", suggestion: "" };
     }
 };
 
 export const fetchTrendingKeywords = async (niche: string): Promise<string[]> => {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const apiKey = getApiKey();
+    // BYPASS: If no key, return generic tags
+    if (!apiKey) return ["#viral", "#trending", "#demo"];
+    
+    const ai = new GoogleGenAI({ apiKey });
     const prompt = `
     List 5 currently trending high-traffic SEO keywords and hashtags specifically for the "${niche}" niche on TikTok and Instagram Reels for today.
     Return JSON: { "keywords": ["word1", "word2", "word3", "word4", "word5"] }
@@ -105,7 +155,7 @@ export const getStockImage = async (keyword: string): Promise<string> => {
     const pexelsKey = process.env.PEXELS_API_KEY;
     const fallbackUrl = `https://picsum.photos/seed/${keyword}/1080/1920`;
 
-    if (!pexelsKey || pexelsKey.length < 10) return fallbackUrl;
+    if (!pexelsKey || pexelsKey.length < 10 || pexelsKey === 'undefined') return fallbackUrl;
 
     try {
         const response = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(keyword)}&per_page=1&orientation=portrait`, {
@@ -122,20 +172,21 @@ export const getStockImage = async (keyword: string): Promise<string> => {
 
 // --- SCRIPT GENERATION ---
 export const generateVideoScript = async (input: VideoInputData): Promise<GeneratedScript> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = getApiKey();
+  
+  // BYPASS: If no key, return Mock Script immediately.
+  if (!apiKey) {
+      console.warn("No API Key found. Using Demo Script.");
+      return MOCK_SCRIPT;
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
 
   const numScenes = input.duration === DurationOption.SHORT ? 6 : 10;
   
   const systemInstruction = `
     You are "Viralize Pro", an AI marketing expert.
     GOAL: ${input.marketingGoal}.
-    
-    STRATEGY BASED ON GOAL:
-    - SALES: Focus on pain points, immediate solution, scarcity, and direct "Buy Now" CTA.
-    - TRAFFIC: Create curiosity gaps ("Link in bio to see how"), teaser content.
-    - ENGAGEMENT: Ask questions, use controversial/funny hooks, "Comment 'Yes' if...".
-    - AWARENESS: Focus on brand values, aesthetic, emotional connection.
-
     SEO: Distribute the keywords: [${input.customKeywords}] across the scenes.
   `;
 
@@ -195,6 +246,14 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
   }
 };
 
+// Helper: Generate a simple beep WAV in base64 for demo purposes
+const generateMockAudioBase64 = (): string => {
+    // Very simple WAV header for 1 second of silence/noise to keep FFmpeg happy
+    // This is a minimal valid 16-bit PCM WAV
+    const header = "UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="; // Empty valid wav
+    return header; 
+}
+
 export const generateNarration = async (text: string, onRetry?: (msg: string) => void): Promise<string> => {
     const cached = getCachedAudio(text);
     if (cached) {
@@ -202,8 +261,19 @@ export const generateNarration = async (text: string, onRetry?: (msg: string) =>
         return cached;
     }
 
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const MAX_RETRIES = 50; // No Fail Protocol
+    const apiKey = getApiKey();
+    
+    // BYPASS: If no key, return dummy audio so FFmpeg doesn't crash
+    if (!apiKey) {
+        console.warn("No API Key. Returning mock audio.");
+        // We return a small valid WAV string. The user won't hear voice, but the video will build.
+        // For a better experience, we could return a predefined b64 string of a generic voice, 
+        // but for now we prioritize not crashing.
+        return generateMockAudioBase64();
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const MAX_RETRIES = 50; 
     let lastError;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
