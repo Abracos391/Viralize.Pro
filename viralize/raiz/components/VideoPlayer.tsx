@@ -120,7 +120,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 const scene = script.scenes[i];
                 let success = false;
                 let attempts = 0;
-                const MAX_SCENE_RETRIES = 3;
+                const MAX_SCENE_RETRIES = 2; // REDUCED RETRIES FOR SPEED
                 
                 while (!success && attempts < MAX_SCENE_RETRIES) {
                     setLoadingStatus(`Synthesizing Audio ${i + 1}/${script.scenes.length}...`);
@@ -140,7 +140,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                     } catch (e) {
                         attempts++;
                         if (attempts >= MAX_SCENE_RETRIES) {
-                             console.warn(`Failed to generate audio for scene ${i+1} after ${attempts} attempts. Using fallback.`);
+                             console.warn(`Failed to generate audio for scene ${i+1}. Using fallback.`);
                              // Fallback to mock audio to prevent infinite loop
                              if (audioCtxRef.current) {
                                  const mockB64 = generateMockAudioBase64();
@@ -149,8 +149,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                                  success = true;
                              }
                         } else {
-                            setLoadingStatus(`Retry ${attempts}/${MAX_SCENE_RETRIES} (Scene ${i+1})...`);
-                            await new Promise(r => setTimeout(r, 2000));
+                            setLoadingStatus(`Retrying (${attempts}/${MAX_SCENE_RETRIES})...`);
+                            await new Promise(r => setTimeout(r, 1000));
                         }
                     }
                 }
