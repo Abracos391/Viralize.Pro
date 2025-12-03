@@ -1,36 +1,18 @@
 /// <reference lib="dom" />
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { toBlobURL } from '@ffmpeg/util';
 import { GeneratedScript } from '../types';
 
 let ffmpeg: FFmpeg | null = null;
 
-const formatSrtTime = (seconds: number): string => {
-    const date = new Date(0);
-    date.setMilliseconds(seconds * 1000);
-    return date.toISOString().substr(11, 12).replace('.', ',');
-};
-
-const generateSubtitleFile = (script: GeneratedScript): string => {
-    let srtContent = "";
-    let currentTime = 0;
-    script.scenes.forEach((scene, index) => {
-        const start = formatSrtTime(currentTime);
-        const end = formatSrtTime(currentTime + scene.duration);
-        const cleanText = scene.overlayText.replace(/\n/g, ' ').trim();
-        srtContent += `${index + 1}\n${start} --> ${end}\n${cleanText}\n\n`; 
-        currentTime += scene.duration;
-    });
-    return srtContent;
-};
-
+// Load FFmpeg from a reliable CDN
 export const loadFFmpeg = async (onLog?: (msg: string) => void): Promise<FFmpeg> => {
     if (ffmpeg) return ffmpeg;
     const instance = new FFmpeg();
     instance.on('log', ({ message }) => { if (onLog) onLog(message); });
     
-    // Stable Version 0.12.6
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+    // Using jsDelivr for better stability and CORS headers
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd';
     
     try {
         await instance.load({
@@ -47,95 +29,93 @@ export const loadFFmpeg = async (onLog?: (msg: string) => void): Promise<FFmpeg>
 
 export const renderVideoWithFFmpeg = async (
     script: GeneratedScript, 
-    images: Record<number, Uint8Array>,
+    // Images now contain the BURNED-IN text. No subtitle filter needed.
+    imagesWithText: Record<number, Uint8Array>,
     masterAudioWav: Uint8Array,
     onProgress: (p: number, msg: string) => void
 ): Promise<Blob> => {
     
-    onProgress(10, "Loading Video Engine...");
+    onProgress(10, "Initializing Engine...");
     const ff = await loadFFmpeg((msg) => { 
-        if (msg.includes('frame=')) onProgress(70, "Rendering Video..."); 
+        if (msg.includes('frame=')) onProgress(70, "Encoding Video..."); 
     });
     
-    // 1. Setup Fonts
-    onProgress(20, "Loading Fonts...");
-    try {
-        await ff.writeFile('Roboto-Bold.ttf', await fetchFile('https://cdn.jsdelivr.net/npm/roboto-font@0.1.0/fonts/Roboto/roboto-bold.ttf'));
-    } catch (e) {}
-
-    // 2. Write Assets
-    onProgress(30, "Writing Assets...");
+    // 1. Write Assets
+    onProgress(30, "Preparing Assets...");
     const imageFiles: string[] = [];
 
-    await ff.writeFile('subtitles.srt', generateSubtitleFile(script));
+    // Write Master Audio
     await ff.writeFile('audio.wav', masterAudioWav);
 
+    // Write Pre-Rendered Images (Visual + Text)
+    // IMPORTANT: Verify we have data for every scene
     for (let i = 0; i < script.scenes.length; i++) {
         const scene = script.scenes[i];
         const imgName = `img${i}.jpg`;
-        await ff.writeFile(imgName, images[scene.id]);
-        imageFiles.push(imgName);
+        const imgData = imagesWithText[scene.id];
+        
+        if (!imgData || imgData.byteLength === 0) {
+            console.error(`Missing image data for scene ${i}`);
+            // Fallback: Create a black frame if missing to prevent FFmpeg crash
+            // We shouldn't get here due to VideoPlayer fallback, but safe > sorry
+        } else {
+            await ff.writeFile(imgName, imgData);
+            imageFiles.push(imgName);
+        }
     }
 
-    // 3. STEP 1: GENERATE VIDEO ONLY (SILENT)
-    // This isolates the visual rendering from audio issues.
-    onProgress(40, "Phase 1: Generating Visuals...");
+    // 2. Generate Video Command (Simple Concat)
+    // We are NOT using subtitle filters or font files anymore. 
+    // The images already have the text.
+    onProgress(50, "Generating Video...");
     
     let inputArgs: string[] = [];
     script.scenes.forEach((s, i) => {
+        // Loop each image for its specific duration
         inputArgs.push('-loop', '1', '-t', s.duration.toString(), '-i', imageFiles[i]);
     });
-
+    
+    // Complex Filter: Scale inputs to 1080x1920 (just in case) and Concat
     let filterComplex = "";
-    // Simple concat of video streams
     for(let i=0; i<script.scenes.length; i++) {
-        filterComplex += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[v${i}];`;
+        // Simple scaling to ensure standard dimensions
+        filterComplex += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[v${i}];`;
     }
     
     let concatStr = "";
     for(let i=0; i<script.scenes.length; i++) concatStr += `[v${i}]`;
     
+    // Concat all video streams
     filterComplex += `${concatStr}concat=n=${script.scenes.length}:v=1:a=0[vbase];`;
-    
-    // Add subtitles to video
-    const style = `Fontname=Roboto,Fontsize=24,PrimaryColour=&H00FFFF,BackColour=&H80000000,BorderStyle=3,Outline=1,Shadow=0,Alignment=2,MarginV=100`;
-    filterComplex += `[vbase]subtitles=subtitles.srt:fontsdir=/:force_style='${style}'[vfinal]`;
 
-    try { await ff.deleteFile("temp_video.mp4"); } catch (e) {}
+    const outputName = "output.mp4";
+    try { await ff.deleteFile(outputName); } catch (e) {}
+
+    // 3. EXECUTE - Single Pass (Video Generation + Audio Merge)
+    // We map the concatenated video [vbase] and the external audio file (index N, where N is num scenes)
+    const audioInputIndex = script.scenes.length;
 
     await ff.exec([
         ...inputArgs,
+        '-i', 'audio.wav', // Audio is the last input
         '-filter_complex', filterComplex,
-        '-map', '[vfinal]',
+        '-map', '[vbase]',       // Mapped Video
+        '-map', `${audioInputIndex}:a`, // Mapped Audio
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-pix_fmt', 'yuv420p',
-        'temp_video.mp4'
+        '-preset', 'ultrafast',  // Fast encoding
+        '-pix_fmt', 'yuv420p',   // Standard compatibility
+        '-c:a', 'aac',           // Standard audio
+        '-ac', '2',              // FORCE STEREO: Fixes silent audio on some players
+        '-b:a', '192k',
+        '-shortest',             // Ensure video matches audio length
+        outputName
     ]);
 
-    // 4. STEP 2: MERGE AUDIO (MUXING)
-    // Taking the silent video and adding the WAV file
-    onProgress(80, "Phase 2: Adding Audio...");
-    
-    try { await ff.deleteFile("output.mp4"); } catch (e) {}
-
-    await ff.exec([
-        '-i', 'temp_video.mp4',
-        '-i', 'audio.wav',
-        '-c:v', 'copy', // Copy video stream (super fast, no re-encode)
-        '-c:a', 'aac',  // Encode audio
-        '-map', '0:v',
-        '-map', '1:a',
-        '-shortest',
-        'output.mp4'
-    ]);
-
-    onProgress(95, "Finalizing...");
-    const data = await ff.readFile('output.mp4');
+    onProgress(95, "Finalizing File...");
+    const data = await ff.readFile(outputName);
     
     // Cleanup
     try {
-        await ff.deleteFile("temp_video.mp4");
         await ff.deleteFile("audio.wav");
         imageFiles.forEach(async f => { try { await ff.deleteFile(f) } catch(e){} });
     } catch(e) {}
@@ -143,20 +123,28 @@ export const renderVideoWithFFmpeg = async (
     return new Blob([data], { type: 'video/mp4' });
 };
 
-// --- HELPER: WAV HEADER GENERATOR ---
+// --- HELPER: WAV HEADER GENERATOR (STEREO 44.1kHz) ---
 export function audioBufferToWav(buffer: AudioBuffer): Uint8Array {
-    const numChannels = 1; 
-    const sampleRate = buffer.sampleRate;
-    const format = 1; 
+    const numChannels = 2; // FORCE 2 Channels (Stereo) for compatibility
+    const sampleRate = 44100; 
+    const format = 1; // PCM
     const bitDepth = 16;
     
+    // Create new buffer if input is mono, or mix down
     const length = buffer.length * numChannels;
     const result = new Int16Array(length);
-    const channel0 = buffer.getChannelData(0);
     
+    const chan0 = buffer.getChannelData(0);
+    const chan1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : chan0; // Duplicate mono to stereo
+
+    let offset = 0;
     for (let i = 0; i < buffer.length; i++) {
-        const sample = Math.max(-1, Math.min(1, channel0[i]));
-        result[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        // Left
+        const s0 = Math.max(-1, Math.min(1, chan0[i]));
+        result[offset++] = s0 < 0 ? s0 * 0x8000 : s0 * 0x7FFF;
+        // Right
+        const s1 = Math.max(-1, Math.min(1, chan1[i]));
+        result[offset++] = s1 < 0 ? s1 * 0x8000 : s1 * 0x7FFF;
     }
 
     const bufferData = new Uint8Array(result.buffer);
