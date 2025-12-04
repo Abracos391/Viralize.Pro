@@ -2,6 +2,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult } from "../types";
 
 // --- API KEY STRATEGY ---
+// Chave de emergência mantida para facilitar testes, mas prioriza a do usuário
 const EMERGENCY_KEY = "AIzaSyBSEELLWDIa01iwsXLlGtNHg283oqSu65g";
 
 export const getApiKey = (): string => {
@@ -30,12 +31,12 @@ const MOCK_SCRIPT: GeneratedScript = {
     hashtags: ["#demo", "#viralize"],
     estimatedViralScore: 90,
     scenes: [
-        { id: 1, duration: 2.5, narration: "Bem-vindo ao modo de demonstração do Viralize Pro.", overlayText: "MODO DEMONSTRAÇÃO", imageKeyword: "futuristic technology interface", isCta: false },
-        { id: 2, duration: 2.5, narration: "Estamos usando dados de exemplo pois a chave API não foi detectada.", overlayText: "SEM CHAVE API", imageKeyword: "security lock digital", isCta: false },
-        { id: 3, duration: 2.5, narration: "Insira sua chave nas configurações para usar a Inteligência Artificial.", overlayText: "CONFIGURAÇÕES", imageKeyword: "settings gear icon", isCta: false },
-        { id: 4, duration: 2.5, narration: "O sistema gera áudio e vídeo diretamente no seu navegador.", overlayText: "RENDERIZAÇÃO LOCAL", imageKeyword: "browser computer speed", isCta: false },
-        { id: 5, duration: 2.5, narration: "Experimente clicar em baixar para testar o arquivo final.", overlayText: "TESTE O DOWNLOAD", imageKeyword: "download button symbol", isCta: true },
-        { id: 6, duration: 2.5, narration: "Crie vídeos virais em segundos com nossa tecnologia.", overlayText: "CRIE AGORA", imageKeyword: "rocket launch space", isCta: true }
+        { id: 1, duration: 2.5, narration: "Bem-vindo ao Viralize Pro. Este é um teste de áudio e vídeo.", overlayText: "MODO DEMONSTRAÇÃO", imageKeyword: "technology interface", isCta: false },
+        { id: 2, duration: 2.5, narration: "Estamos testando a mixagem de áudio offline para garantir sincronia.", overlayText: "SINCRONIA TOTAL", imageKeyword: "sound wave visualization", isCta: false },
+        { id: 3, duration: 2.5, narration: "O sistema funde todos os áudios em uma faixa mestra antes de gravar.", overlayText: "RENDERIZAÇÃO", imageKeyword: "processor chip", isCta: false },
+        { id: 4, duration: 2.5, narration: "Isso garante que o vídeo final tenha som contínuo e sem falhas.", overlayText: "SEM FALHAS", imageKeyword: "security shield", isCta: false },
+        { id: 5, duration: 2.5, narration: "Aguarde o final da gravação para baixar seu arquivo.", overlayText: "AGUARDE...", imageKeyword: "hourglass time", isCta: true },
+        { id: 6, duration: 2.5, narration: "Clique no botão de download para salvar o resultado.", overlayText: "BAIXAR AGORA", imageKeyword: "download arrow", isCta: true }
     ]
 };
 
@@ -51,16 +52,20 @@ const parseJSON = (text: string) => {
 
 export const getStockImage = async (query: string): Promise<string> => {
     const pexelsKey = process.env.PEXELS_API_KEY;
+    // Fallback seed based on query to ensure variety even without API
+    const fallback = `https://picsum.photos/seed/${encodeURIComponent(query)}/1080/1920`;
+
     if (pexelsKey && pexelsKey.length > 10 && pexelsKey !== 'undefined') {
         try {
             const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=portrait`, {
                 headers: { Authorization: pexelsKey }
             });
+            if (!res.ok) return fallback;
             const data = await res.json();
             if (data.photos && data.photos.length > 0) return data.photos[0].src.portrait;
         } catch(e) { console.warn("Pexels error", e); }
     }
-    return `https://picsum.photos/seed/${encodeURIComponent(query)}/1080/1920`;
+    return fallback;
 };
 
 export const generateVideoScript = async (input: VideoInputData): Promise<GeneratedScript> => {
@@ -71,7 +76,7 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
     const scenesCount = input.duration === DurationOption.SHORT ? 6 : 10;
 
     const prompt = `
-    ATUE COMO UM REDATOR PUBLICITÁRIO BRASILEIRO ESPECIALISTA EM TIKTOK.
+    ATUE COMO UM REDATOR PUBLICITÁRIO BRASILEIRO ESPECIALISTA EM VÍDEOS CURTOS.
     
     PRODUTO: ${input.productName}
     DESCRIÇÃO: ${input.description}
@@ -80,25 +85,25 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
     DURAÇÃO: ${scenesCount} cenas.
 
     REGRAS ESTRITAS DE FORMATAÇÃO (JSON):
-    1. IDIOMA: Use APENAS PORTUGUÊS DO BRASIL para "narration" e "overlayText".
-    2. TÍTULO: Um título curto e comercial (Ex: "Oferta Imperdível"). NUNCA use hífens, underlines ou nomes de arquivo (Ex: proibido "oferta-imperdivel-v1").
-    3. IMAGENS: Para "imageKeyword", use termos VISUAIS em INGLÊS (Ex: "Happy woman holding phone", não use "Felicidade").
-    4. SINTAXE: Retorne apenas o JSON válido.
+    1. IDIOMA: Use APENAS PORTUGUÊS DO BRASIL.
+    2. TÍTULO: Um título curto e comercial sem caracteres especiais (Ex: "Oferta Incrível").
+    3. IMAGENS: Para "imageKeyword", use termos VISUAIS em INGLÊS CONCRETOS (Ex: "Man holding smartphone", não "Technology").
+    4. CENA FINAL: Deve ser um Call to Action (CTA) claro.
 
-    SCHEMA:
+    SCHEMA JSON OBRIGATÓRIO:
     {
-        "title": "Título Bonito",
-        "tone": "Energético",
-        "seoKeywords": ["keyword1"],
+        "title": "Título do Vídeo",
+        "tone": "Empolgante",
+        "seoKeywords": ["tag1"],
         "hashtags": ["#tag1"],
         "estimatedViralScore": 95,
         "scenes": [
             { 
                 "id": 1, 
-                "duration": number (segundos), 
-                "narration": "Texto falado em português...", 
-                "overlayText": "TEXTO DA TELA", 
-                "imageKeyword": "visual description in english", 
+                "duration": number (segundos float), 
+                "narration": "Texto falado...", 
+                "overlayText": "TEXTO TELA", 
+                "imageKeyword": "visual english term", 
                 "isCta": boolean 
             }
         ]
@@ -110,7 +115,10 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
             contents: prompt,
             config: { responseMimeType: "application/json" }
         });
-        return parseJSON(res.text || "");
+        const parsed = parseJSON(res.text || "");
+        // Fallback safety for scene count
+        if (!parsed.scenes || parsed.scenes.length < scenesCount) return MOCK_SCRIPT;
+        return parsed;
     } catch (e) {
         console.error("Script gen failed", e);
         return MOCK_SCRIPT;
@@ -119,9 +127,10 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 
 export const generateNarration = async (text: string): Promise<string> => {
     const key = getApiKey();
+    // Return a flag that triggers local silence generation instead of breaking
     if (!key) return "SILENCE";
 
-    const cacheKey = `tts_br_${text.substring(0, 15)}_${text.length}`;
+    const cacheKey = `tts_v2_${text.substring(0, 15)}_${text.length}`;
     const cached = localStorage.getItem(cacheKey);
     if (cached) return cached;
 
@@ -143,7 +152,7 @@ export const generateNarration = async (text: string): Promise<string> => {
             return data;
         }
     } catch (e) {
-        console.warn("TTS Failed", e);
+        console.warn("TTS Failed, falling back to silence", e);
     }
     return "SILENCE";
 };
