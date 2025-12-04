@@ -55,9 +55,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   }, []);
 
   useEffect(() => {
-      // Mute only affects speakers path if we split nodes, but for simplicity here we control gain.
-      // Note: This mutes recording too. Ideally we split, but for MVP this is fine.
-      // To record while muted, we would need separate gains.
       if (gainNodeRef.current) gainNodeRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
@@ -103,7 +100,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       let mounted = true;
       const load = async () => {
           setIsReady(false);
-          setLoadingStatus("Loading Assets...");
+          setLoadingStatus("Carregando Ativos...");
           stopPlayback();
 
           const tempImgCache: Record<number, HTMLImageElement> = {};
@@ -126,7 +123,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           const audioPromises = script.scenes.map(async (s) => {
               if (!audioCtxRef.current) return;
               try {
-                  setLoadingStatus(`Synthesizing Voice for Scene ${s.id}...`);
+                  setLoadingStatus(`Gerando Voz da Cena ${s.id}...`);
                   const b64 = await generateNarration(s.narration);
                   if (b64 === "SILENCE") return;
                   
@@ -142,13 +139,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           await Promise.all([...imgPromises, ...audioPromises]);
 
           // C. Stitch Audio
-          setLoadingStatus("Mastering Audio...");
+          setLoadingStatus("Masterizando Áudio...");
           const master = await createMasterTrack(tempAudioClips);
           masterAudioBufferRef.current = master;
           imageCache.current = tempImgCache;
 
           if (mounted) {
-              setLoadingStatus("Ready");
+              setLoadingStatus("Pronto");
               setIsReady(true);
               setTimeout(() => drawFrame(0), 100);
           }
@@ -243,6 +240,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       const cx = cvs.width / 2;
       const cy = cvs.height / 2;
 
+      // Overlay Text (Uppercase, Big)
       ctx.save();
       ctx.fillStyle = "white";
       ctx.shadowColor = "black";
@@ -252,6 +250,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       wrapText(ctx, activeScene.overlayText.toUpperCase(), cx, cy, cvs.width * 0.85, 65);
       ctx.restore();
 
+      // Subtitles (Captions - Bottom)
       ctx.save();
       ctx.font = 'bold 28px Inter, sans-serif';
       ctx.textAlign = 'center';
@@ -303,11 +302,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const handleDownload = async () => {
       if (!canvasRef.current || !audioCtxRef.current || !destNodeRef.current) return;
       
-      // Force volume UP for recording (even if muted locally)
-      // Note: In this simple gain setup, unmuting user hears it too.
-      // For proper hidden recording we need split nodes, but this ensures audio exists.
       if (isMuted) setIsMuted(false); 
-      
       await ensureAudioActive();
 
       const canvasStream = canvasRef.current.captureStream(30);
@@ -340,7 +335,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = `${script.title.replace(/\s+/g, '_')}_viral.webm`;
+          // Clean title for filename
+          const cleanTitle = script.title.replace(/[^a-zA-Z0-9]/g, '_');
+          a.download = `${cleanTitle}_viral.webm`;
           document.body.appendChild(a);
           a.click();
           setTimeout(() => URL.revokeObjectURL(url), 2000);
@@ -350,6 +347,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       recorder.start();
       startPlayback(true);
   };
+
+  // Clean Display Title
+  const displayTitle = script.title.replace(/-/g, ' ');
 
   return (
     <div className="flex flex-col lg:flex-row gap-8 items-start justify-center max-w-7xl mx-auto p-4">
@@ -365,8 +365,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             {isProcessing && (
                 <div className="absolute inset-0 z-40 bg-black/80 flex flex-col items-center justify-center">
                     <div className="w-16 h-16 border-4 border-red-500 border-t-transparent rounded-full animate-spin mb-4" />
-                    <p className="text-white font-bold">Recording Video...</p>
-                    <p className="text-xs text-gray-400">Do not close window</p>
+                    <p className="text-white font-bold">Gravando Vídeo...</p>
+                    <p className="text-xs text-gray-400">Não feche a janela</p>
                 </div>
             )}
 
@@ -376,11 +376,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         {/* CONTROLS */}
         <div className="flex-1 w-full max-w-md space-y-6">
             <div className="bg-gray-800/60 border border-gray-700 rounded-2xl p-6 backdrop-blur-xl">
-                <h3 className="text-2xl font-bold text-white mb-2">{script.title}</h3>
+                <h3 className="text-2xl font-bold text-white mb-2">{displayTitle}</h3>
                 <div className="flex gap-4 mb-4">
                     <button onClick={() => isPlaying ? stopPlayback() : startPlayback(false)} disabled={!isReady || isProcessing} className="flex-1 bg-brand-600 hover:bg-brand-500 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition disabled:opacity-50">
                         {isPlaying ? <Pause size={20}/> : <Play size={20}/>}
-                        {isPlaying ? "Pause" : "Preview"}
+                        {isPlaying ? "Pausar" : "Prévia"}
                     </button>
                     <button onClick={() => setIsMuted(!isMuted)} className="p-3 bg-gray-700 rounded-xl hover:bg-gray-600">
                         {isMuted ? <VolumeX/> : <Volume2/>}
@@ -393,11 +393,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                     className="w-full bg-white text-black py-4 rounded-xl font-black text-lg flex items-center justify-center gap-3 hover:bg-gray-200 transition shadow-lg disabled:opacity-50"
                 >
                     {isProcessing ? <Loader2 className="animate-spin text-red-600"/> : <Download className="text-brand-600"/>}
-                    {isProcessing ? "Recording..." : "Download Video"}
+                    {isProcessing ? "Gravando..." : "Baixar Vídeo"}
                 </button>
             </div>
             <button onClick={onEditRequest} disabled={isProcessing} className="w-full text-center text-gray-400 underline hover:text-white text-sm">
-                Back to Editor
+                Voltar e Editar
             </button>
         </div>
     </div>
