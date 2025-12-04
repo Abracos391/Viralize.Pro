@@ -2,10 +2,14 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// Robust path resolution for Render nested structures
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DIST_DIR = path.join(process.cwd(), 'dist');
+
+// Resolve paths relative to THIS file, not the command execution folder
+// This fixes "File not found" errors if Render runs the script from the repo root
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DIST_DIR = path.join(__dirname, 'dist');
 
 // Serve static files from the dist directory
 app.use(express.static(DIST_DIR));
@@ -17,5 +21,5 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-  console.log(`Serving files from: ${DIST_DIR}`);
+  console.log(`Serving app from: ${DIST_DIR}`);
 });
