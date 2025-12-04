@@ -24,18 +24,18 @@ export const hasValidKey = () => !!getApiKey();
 
 // --- MOCK DATA ---
 const MOCK_SCRIPT: GeneratedScript = {
-    title: "Demo Mode (Active)",
-    tone: "Energetic",
-    seoKeywords: ["demo", "test"],
-    hashtags: ["#demo"],
+    title: "Modo Demonstração (Sem Chave)",
+    tone: "Energético",
+    seoKeywords: ["demo", "teste"],
+    hashtags: ["#demo", "#viralizepro"],
     estimatedViralScore: 90,
     scenes: [
-        { id: 1, duration: 2.5, narration: "Welcome to Viralize Pro. This is a demo.", overlayText: "DEMO MODE", imageKeyword: "futuristic technology hud interface", isCta: false },
-        { id: 2, duration: 2.5, narration: "Please add a valid Google API Key to generate real videos.", overlayText: "ADD API KEY", imageKeyword: "security key lock", isCta: false },
-        { id: 3, duration: 2.5, narration: "We use AI to generate scripts and visuals.", overlayText: "AI POWERED", imageKeyword: "artificial intelligence brain", isCta: false },
-        { id: 4, duration: 2.5, narration: "Rendering happens directly in your browser.", overlayText: "BROWSER RENDER", imageKeyword: "web browser internet speed", isCta: false },
-        { id: 5, duration: 2.5, narration: "Download compliant videos instantly.", overlayText: "INSTANT DOWNLOAD", imageKeyword: "download cloud data", isCta: true },
-        { id: 6, duration: 2.5, narration: "Get started now!", overlayText: "START NOW", imageKeyword: "rocket launch success", isCta: true }
+        { id: 1, duration: 2.5, narration: "Bem-vindo ao Viralize Pro. Este é um modo de demonstração.", overlayText: "MODO DEMONSTRAÇÃO", imageKeyword: "futuristic technology hud interface", isCta: false },
+        { id: 2, duration: 2.5, narration: "Por favor, adicione uma chave API do Google válida para gerar vídeos reais.", overlayText: "ADICIONE SUA CHAVE", imageKeyword: "security key lock", isCta: false },
+        { id: 3, duration: 2.5, narration: "Usamos inteligência artificial para criar roteiros e visuais.", overlayText: "PODER DA IA", imageKeyword: "artificial intelligence brain", isCta: false },
+        { id: 4, duration: 2.5, narration: "A renderização acontece diretamente no seu navegador.", overlayText: "RENDER NO BROWSER", imageKeyword: "web browser internet speed", isCta: false },
+        { id: 5, duration: 2.5, narration: "Baixe vídeos compatíveis instantaneamente.", overlayText: "DOWNLOAD RÁPIDO", imageKeyword: "download cloud data", isCta: true },
+        { id: 6, duration: 2.5, narration: "Comece agora mesmo!", overlayText: "COMECE AGORA", imageKeyword: "rocket launch success", isCta: true }
     ]
 };
 
@@ -71,26 +71,34 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
     const ai = new GoogleGenAI({ apiKey: key });
     const scenesCount = input.duration === DurationOption.SHORT ? 6 : 10;
 
+    // PROMPT EM PORTUGUÊS REFORÇADO
     const prompt = `
-    Create a VIRAL SHORT VIDEO SCRIPT.
-    Product: ${input.productName}
-    Desc: ${input.description}
-    Target: ${input.targetAudience}
-    Length: ${scenesCount} scenes.
+    ATUE COMO UM ESPECIALISTA EM MARKETING VIRAL BRASILEIRO.
+    Crie um ROTEIRO DE VÍDEO CURTO (TikTok/Reels).
+    
+    Produto: ${input.productName}
+    Descrição: ${input.description}
+    Público: ${input.targetAudience}
+    Duração: ${scenesCount} cenas.
 
-    RULES FOR 'imageKeyword':
-    - MUST be a visual description for a stock photo site.
-    - BAD: "Freedom", "Success".
-    - GOOD: "Woman running on beach", "Man in suit holding money".
+    REGRAS CRÍTICAS (Idiomas & Estilo):
+    1. IDIOMA: TUDO DEVE ESTAR EM PORTUGUÊS DO BRASIL (PT-BR).
+    2. Narração deve ser natural, engajadora e usar linguagem coloquial se adequado ao público.
+    3. 'overlayText' (Texto na tela) deve ser curto, impactante e EM PORTUGUÊS (Caixa Alta).
+    4. TÍTULO: Deve ser limpo e comercial (ex: "StreamDroid Oficial" e NÃO "streamdroid-v1").
+
+    REGRAS PARA 'imageKeyword':
+    - DEVE SER EM INGLÊS (para buscar no banco de imagens).
+    - Descreva a imagem visualmente. Ex: "Woman holding smartphone smiling", "Soccer ball on grass".
     
     Output JSON: {
-        "title": "string",
-        "tone": "string",
-        "seoKeywords": ["string"],
-        "hashtags": ["string"],
+        "title": "Título Comercial Limpo (PT-BR)",
+        "tone": "Tom da voz (ex: Animado)",
+        "seoKeywords": ["palavra1", "palavra2"],
+        "hashtags": ["#tag1", "#tag2"],
         "estimatedViralScore": number,
         "scenes": [
-            { "id": 1, "duration": number, "narration": "string", "overlayText": "string", "imageKeyword": "VISUAL_DESCRIPTION", "isCta": boolean }
+            { "id": 1, "duration": number, "narration": "Texto falado em PT-BR", "overlayText": "TEXTO TELA PT-BR", "imageKeyword": "VISUAL_DESCRIPTION_IN_ENGLISH", "isCta": boolean }
         ]
     }`;
 
@@ -111,7 +119,7 @@ export const generateNarration = async (text: string): Promise<string> => {
     if (!key) return "SILENCE";
 
     // Simple Cache
-    const cacheKey = `tts_${text.substring(0,20)}`;
+    const cacheKey = `tts_ptbr_${text.substring(0,20)}`;
     const cached = localStorage.getItem(cacheKey);
     if (cached) return cached;
 
@@ -122,7 +130,13 @@ export const generateNarration = async (text: string): Promise<string> => {
             contents: [{ parts: [{ text }] }],
             config: {
                 responseModalities: [Modality.AUDIO],
-                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
+                speechConfig: { 
+                    voiceConfig: { 
+                        // Using a voice config, Gemini usually auto-detects language from text
+                        // Providing PT-BR text ensures PT-BR speech.
+                        prebuiltVoiceConfig: { voiceName: 'Kore' } 
+                    } 
+                }
             }
         });
         const data = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -135,8 +149,7 @@ export const generateNarration = async (text: string): Promise<string> => {
 };
 
 export const validateContentSafety = async (p: string, d: string): Promise<ComplianceResult> => {
-    // Always return safe to prevent blocking. The AI check is optional enhancement.
     return { isSafe: true, flaggedCategories: [], reason: "Pass", suggestion: "" };
 };
 
-export const fetchTrendingKeywords = async (n: string) => ["#viral", "#trending", "#fyp"];
+export const fetchTrendingKeywords = async (n: string) => ["#viral", "#brasil", "#tendencia"];
