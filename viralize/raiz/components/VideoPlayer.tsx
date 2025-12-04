@@ -1,8 +1,9 @@
 /// <reference lib="dom" />
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
-import { Play, Pause, Volume2, VolumeX, Download, Loader2 } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Download, Loader2, CloudLightning } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
+import { renderWithShotstack, getShotstackKey } from '../services/shotstackService';
 
 interface VideoPlayerProps {
   script: GeneratedScript;
@@ -15,147 +16,35 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [isMuted, setIsMuted] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState("Initializing...");
   const [isReady, setIsReady] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
+  const [isRendering, setIsRendering] = useState(false);
   
-  // Refs for Assets
+  // Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
   
-  // Audio Engine Refs
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const speakerGainRef = useRef<GainNode | null>(null); // Controls volume for user hearing
-  const recorderGainRef = useRef<GainNode | null>(null); // Always 1.0 for recording
-  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  
-  // Master Track Buffer
-  const masterBufferRef = useRef<AudioBuffer | null>(null);
-  const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  
-  // Animation Refs
-  const reqIdRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  // Simple Audio (Preview Only)
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // 1. INIT AUDIO ENGINE (Split Routing)
-  useEffect(() => {
-    const init = () => {
-        const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
-        if (!Ctx) return;
-        
-        const ctx = new Ctx();
-        
-        // Create Nodes
-        const speakerGain = ctx.createGain(); // For headphones/speakers
-        const recorderGain = ctx.createGain(); // For video file (Always 1.0)
-        const dest = ctx.createMediaStreamDestination(); // The Recorder Input
-        
-        // Routing:
-        // Source -> [Connects later to both Gains]
-        
-        // Gain 1 -> Speakers
-        speakerGain.connect(ctx.destination);
-        
-        // Gain 2 -> Recorder
-        recorderGain.gain.value = 1.0; // FIXED VOLUME FOR RECORDING
-        recorderGain.connect(dest);
-        
-        audioCtxRef.current = ctx;
-        speakerGainRef.current = speakerGain;
-        recorderGainRef.current = recorderGain;
-        destNodeRef.current = dest;
-    };
-    init();
-    return () => { audioCtxRef.current?.close(); };
-  }, []);
-
-  // Handle Mute (Only affects Speaker Gain, NOT Recorder Gain)
-  useEffect(() => {
-    if (speakerGainRef.current) {
-        speakerGainRef.current.gain.value = isMuted ? 0 : 1;
-    }
-  }, [isMuted]);
-
-  // 2. STITCHING LOGIC (Master Track)
-  const createMasterTrack = (buffers: Record<number, AudioBuffer>, scenes: typeof script.scenes) => {
-      const ctx = audioCtxRef.current;
-      if (!ctx) return null;
-
-      const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
-      const sampleRate = ctx.sampleRate;
-      const length = Math.ceil(totalDuration * sampleRate);
-      
-      const master = ctx.createBuffer(1, length, sampleRate); 
-      const channelData = master.getChannelData(0);
-
-      let offsetTime = 0;
-      
-      scenes.forEach((scene) => {
-          const clip = buffers[scene.id];
-          if (clip) {
-              const clipData = clip.getChannelData(0);
-              const startSample = Math.floor(offsetTime * sampleRate);
-              const maxSamples = Math.floor(scene.duration * sampleRate);
-              const copyLength = Math.min(clipData.length, maxSamples);
-              
-              for (let i = 0; i < copyLength; i++) {
-                  if (startSample + i < length) {
-                      channelData[startSample + i] = clipData[i];
-                  }
-              }
-          }
-          offsetTime += scene.duration;
-      });
-      
-      return master;
-  };
-
-  // 3. ASSET LOADER
+  // 1. ASSET LOADER (For Preview)
   useEffect(() => {
       let mounted = true;
       const load = async () => {
           setIsReady(false);
-          setLoadingStatus("Downloading Visuals...");
+          setLoadingStatus("Loading Preview...");
           
           // A. Images
           for (const s of script.scenes) {
               if (!mounted) return;
               try {
                   const url = await getStockImage(s.imageKeyword);
-                  const safeUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
                   const img = new Image();
                   img.crossOrigin = "anonymous";
-                  img.src = safeUrl;
+                  img.src = url;
                   await new Promise(r => { img.onload = r; img.onerror = r; });
                   imageCache.current[s.id] = img;
               } catch(e) {}
           }
-
-          // B. Audio Clips
-          setLoadingStatus("Synthesizing Audio...");
-          const tempBuffers: Record<number, AudioBuffer> = {};
           
-          for (const s of script.scenes) {
-              if (!mounted) return;
-              try {
-                  const b64 = await generateNarration(s.narration);
-                  if (audioCtxRef.current && b64 !== "SILENCE") {
-                      const bin = atob(b64);
-                      const arr = new Uint8Array(bin.length);
-                      for(let k=0; k<bin.length; k++) arr[k] = bin.charCodeAt(k);
-                      const buf = await audioCtxRef.current.decodeAudioData(arr.buffer);
-                      tempBuffers[s.id] = buf;
-                  }
-              } catch(e) {}
-          }
-
-          // C. Stitch Master Track
-          setLoadingStatus("Mixing Audio Track...");
-          if (audioCtxRef.current) {
-              const master = createMasterTrack(tempBuffers, script.scenes);
-              masterBufferRef.current = master;
-          }
-
           if (mounted) {
               setIsReady(true);
               setLoadingStatus("Ready");
@@ -166,7 +55,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       return () => { mounted = false; };
   }, [script]);
 
-  // 4. DRAWING ENGINE
+  // 2. DRAWING ENGINE (Preview Only)
   const drawFrame = (elapsedTime: number) => {
       const cvs = canvasRef.current;
       const ctx = cvs?.getContext('2d');
@@ -214,18 +103,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       
       ctx.font = "900 48px Inter, sans-serif";
       wrapText(ctx, activeScene.overlayText.toUpperCase(), cx, cy, cvs.width * 0.9, 60);
-
-      ctx.font = "600 24px Inter, sans-serif";
-      wrapSubtitle(ctx, activeScene.narration, cx, cvs.height - 160, cvs.width * 0.85, 34);
       
       ctx.restore();
-
-      if (isRecording) {
-          ctx.fillStyle = "red";
-          ctx.beginPath();
-          ctx.arc(30, 30, 10, 0, Math.PI*2);
-          ctx.fill();
-      }
   };
 
   const wrapText = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, mw: number, lh: number) => {
@@ -241,125 +120,30 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       lines.forEach(l => { ctx.fillText(l, x, sy); sy+=lh; });
   };
 
-  const wrapSubtitle = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, mw: number, lh: number) => {
-      const words = text.split(' ');
-      let line = '', lines = [];
-      for(let w of words) {
-          let test = line + w + ' ';
-          if (ctx.measureText(test).width > mw && line !== '') { lines.push(line); line = w + ' '; }
-          else line = test;
+  // 3. CLOUD RENDER HANDLER
+  const handleCloudRender = async () => {
+      const key = getShotstackKey();
+      if (!key) {
+          alert("Please enter a Shotstack API Key in the settings (top right) to use Cloud Rendering.");
+          return;
       }
-      lines.push(line);
-      let sy = y;
-      lines.forEach(l => {
-         const w = ctx.measureText(l).width;
-         ctx.fillStyle = "rgba(0,0,0,0.6)";
-         ctx.fillRect(x - w/2 - 8, sy - 20, w + 16, 28);
-         ctx.fillStyle = "#fbbf24";
-         ctx.fillText(l, x, sy);
-         sy+=lh;
-      });
-  };
 
-  // 5. PLAYBACK CONTROLLER
-  const startPlayback = async (recordMode: boolean) => {
-      if (!audioCtxRef.current || !masterBufferRef.current || !speakerGainRef.current || !recorderGainRef.current) return;
-      
-      if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
-
-      if (activeSourceRef.current) { try{activeSourceRef.current.stop();}catch(e){} }
-      if (reqIdRef.current) cancelAnimationFrame(reqIdRef.current);
-
-      setIsPlaying(true);
-      startTimeRef.current = Date.now();
-
-      // Play Master Track
-      const src = audioCtxRef.current.createBufferSource();
-      src.buffer = masterBufferRef.current;
-      
-      // CONNECT TO BOTH GAINS
-      src.connect(speakerGainRef.current); // To Speakers (Muteable)
-      src.connect(recorderGainRef.current); // To Recorder (Always 1.0)
-      
-      src.start(0);
-      activeSourceRef.current = src;
-      
-      const totalDuration = masterBufferRef.current.duration * 1000;
-
-      const loop = () => {
-          const now = Date.now();
-          const elapsed = now - startTimeRef.current;
-          
-          if (elapsed >= totalDuration) {
-              if (recordMode) stopRecording();
-              else {
-                  setIsPlaying(false);
-                  if (activeSourceRef.current) { try{activeSourceRef.current.stop();}catch(e){} }
-              }
-              return;
-          }
-
-          drawFrame(elapsed / 1000); 
-          reqIdRef.current = requestAnimationFrame(loop);
-      };
-
-      reqIdRef.current = requestAnimationFrame(loop);
-  };
-
-  const stopPlayback = () => {
-      if (activeSourceRef.current) { try{activeSourceRef.current.stop();}catch(e){} }
-      if (reqIdRef.current) cancelAnimationFrame(reqIdRef.current);
-      setIsPlaying(false);
-  };
-
-  // 6. RECORDING (Mix & Download)
-  const startRecording = async () => {
-      if (!canvasRef.current || !destNodeRef.current || !audioCtxRef.current) return;
-      
-      // Warm up Audio Context
-      if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
-
-      setIsRecording(true);
-      chunksRef.current = [];
-
-      const vStream = canvasRef.current.captureStream(30);
-      const aStream = destNodeRef.current.stream;
-      const combined = new MediaStream([...vStream.getVideoTracks(), ...aStream.getAudioTracks()]);
-
-      // Codec Sniffer
-      let mime = '';
-      if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) mime = 'video/webm;codecs=vp9';
-      else if (MediaRecorder.isTypeSupported('video/webm')) mime = 'video/webm';
-      else if (MediaRecorder.isTypeSupported('video/mp4')) mime = 'video/mp4';
-
-      const rec = new MediaRecorder(combined, mime ? { mimeType: mime } : undefined);
-      rec.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      
-      recorderRef.current = rec;
-      rec.start(100); 
-
-      // Small delay to ensure recorder is "listening" before audio starts
-      setTimeout(() => startPlayback(true), 50);
-  };
-
-  const stopRecording = () => {
-      if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-          recorderRef.current.onstop = saveFile;
-          recorderRef.current.stop();
+      setIsRendering(true);
+      try {
+          const url = await renderWithShotstack(script, (msg) => setLoadingStatus(msg));
+          // Trigger Download
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${script.title}_viral.mp4`;
+          a.target = "_blank";
+          document.body.appendChild(a);
+          a.click();
+          setLoadingStatus("Download Started!");
+      } catch (e: any) {
+          alert("Render Failed: " + e.message);
+          setLoadingStatus("Failed.");
       }
-      setIsRecording(false);
-      setIsPlaying(false);
-  };
-
-  const saveFile = () => {
-      const blob = new Blob(chunksRef.current, { type: 'video/webm' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${script.title.replace(/\s/g, '_')}_viral.webm`;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setIsRendering(false);
   };
 
   return (
@@ -379,29 +163,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         <div className="flex-1 w-full max-w-md space-y-6">
             <div className="bg-gray-800/60 border border-gray-700 rounded-2xl p-6 backdrop-blur-xl">
                 <h3 className="text-2xl font-bold text-white mb-2">{script.title}</h3>
-                <div className="flex gap-3 mb-4">
-                    <button 
-                        onClick={() => isPlaying ? stopPlayback() : startPlayback(false)}
-                        disabled={!isReady || isRecording}
-                        className="flex-1 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2"
-                    >
-                        {isPlaying ? <Pause/> : <Play/>}
-                        {isPlaying ? "Pause" : "Play Preview"}
-                    </button>
-                    <button onClick={() => setIsMuted(!isMuted)} className="bg-gray-700 rounded-xl p-3">
-                        {isMuted ? <VolumeX/> : <Volume2/>}
-                    </button>
+                <div className="mb-4 text-gray-400 text-sm">
+                    Preview Mode (No Audio in Preview - Audio added in Cloud Render)
                 </div>
+
                 <button 
-                    onClick={startRecording}
-                    disabled={!isReady || isRecording}
-                    className="w-full bg-white text-black hover:bg-gray-100 disabled:opacity-50 font-black text-lg py-4 rounded-xl flex items-center justify-center gap-2 shadow-lg"
+                    onClick={handleCloudRender}
+                    disabled={!isReady || isRendering}
+                    className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-black text-lg py-4 rounded-xl flex items-center justify-center gap-3 shadow-lg transform transition hover:-translate-y-1"
                 >
-                    {isRecording ? <Loader2 className="animate-spin text-red-600"/> : <Download className="text-brand-600"/>}
-                    {isRecording ? "Creating Video..." : "Download Video"}
+                    {isRendering ? <Loader2 className="animate-spin text-white"/> : <CloudLightning className="text-yellow-300"/>}
+                    {isRendering ? "Rendering in Cloud..." : "Render Final Video (MP4)"}
                 </button>
+                <p className="text-xs text-center text-gray-500 mt-2">Powered by Shotstack API</p>
             </div>
-            <button onClick={onEditRequest} disabled={isRecording} className="w-full text-center text-gray-400 underline hover:text-white text-sm">
+            <button onClick={onEditRequest} disabled={isRendering} className="w-full text-center text-gray-400 underline hover:text-white text-sm">
                 Back to Editor
             </button>
         </div>
