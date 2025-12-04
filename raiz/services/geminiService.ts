@@ -5,19 +5,13 @@ import { VideoInputData, GeneratedScript, DurationOption, ComplianceResult } fro
 const EMERGENCY_KEY = "AIzaSyBSEELLWDIa01iwsXLlGtNHg283oqSu65g";
 
 export const getApiKey = (): string => {
-    // 1. Check Env (Render/Build)
     let k = process.env.API_KEY || "";
-    
-    // 2. Check Browser Storage (Runtime User Input)
     if (typeof window !== 'undefined') {
         const local = localStorage.getItem('GEMINI_API_KEY');
         if (local) k = local;
     }
-
-    // 3. Validation & Fallback
     if (k && k.length > 10 && k.startsWith("AIza") && k !== 'undefined') return k;
     if (EMERGENCY_KEY && EMERGENCY_KEY.startsWith("AIza")) return EMERGENCY_KEY;
-    
     return "";
 };
 
@@ -45,7 +39,6 @@ const MOCK_SCRIPT: GeneratedScript = {
     ]
 };
 
-// --- HELPERS ---
 const parseJSON = (text: string) => {
     try {
         const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -56,11 +49,8 @@ const parseJSON = (text: string) => {
     }
 };
 
-// --- SERVICES ---
-
 export const getStockImage = async (query: string): Promise<string> => {
     const pexelsKey = process.env.PEXELS_API_KEY;
-    // Prefer Pexels if available
     if (pexelsKey && pexelsKey.length > 10 && pexelsKey !== 'undefined') {
         try {
             const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=portrait`, {
@@ -70,7 +60,6 @@ export const getStockImage = async (query: string): Promise<string> => {
             if (data.photos && data.photos.length > 0) return data.photos[0].src.portrait;
         } catch(e) { console.warn("Pexels error", e); }
     }
-    // Reliable Fallback: Picsum with Seed
     return `https://picsum.photos/seed/${encodeURIComponent(query)}/1080/1920`;
 };
 
@@ -92,7 +81,7 @@ export const generateVideoScript = async (input: VideoInputData): Promise<Genera
 
     REGRAS ESTRITAS DE FORMATAÇÃO (JSON):
     1. IDIOMA: Use APENAS PORTUGUÊS DO BRASIL para "narration" e "overlayText".
-    2. TÍTULO: Um título curto e comercial (Ex: "Oferta Imperdível"). NUNCA use hífens (Ex: "oferta-imperdivel-v1").
+    2. TÍTULO: Um título curto e comercial (Ex: "Oferta Imperdível"). NUNCA use hífens, underlines ou nomes de arquivo (Ex: proibido "oferta-imperdivel-v1").
     3. IMAGENS: Para "imageKeyword", use termos VISUAIS em INGLÊS (Ex: "Happy woman holding phone", não use "Felicidade").
     4. SINTAXE: Retorne apenas o JSON válido.
 
@@ -132,7 +121,6 @@ export const generateNarration = async (text: string): Promise<string> => {
     const key = getApiKey();
     if (!key) return "SILENCE";
 
-    // Simple cache to save API calls
     const cacheKey = `tts_br_${text.substring(0, 15)}_${text.length}`;
     const cached = localStorage.getItem(cacheKey);
     if (cached) return cached;
@@ -161,7 +149,6 @@ export const generateNarration = async (text: string): Promise<string> => {
 };
 
 export const validateContentSafety = async (p: string, d: string): Promise<ComplianceResult> => {
-    // Non-blocking compliance check
     return { isSafe: true, flaggedCategories: [], reason: "Checked", suggestion: "" };
 };
 
