@@ -23,10 +23,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   
   // Audio Engine Refs
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const masterGainRef = useRef<GainNode | null>(null);
+  const speakerGainRef = useRef<GainNode | null>(null); // Controls volume for user hearing
+  const recorderGainRef = useRef<GainNode | null>(null); // Always 1.0 for recording
   const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   
-  // THE KEY FIX: Single Master Buffer instead of array of clips
+  // Master Track Buffer
   const masterBufferRef = useRef<AudioBuffer | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
   
@@ -36,44 +37,55 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
-  // 1. INIT AUDIO ENGINE
+  // 1. INIT AUDIO ENGINE (Split Routing)
   useEffect(() => {
     const init = () => {
         const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
         if (!Ctx) return;
         
         const ctx = new Ctx();
-        const gain = ctx.createGain();
-        const dest = ctx.createMediaStreamDestination();
         
-        gain.connect(ctx.destination); // Speaker output
-        gain.connect(dest);            // Recorder output
+        // Create Nodes
+        const speakerGain = ctx.createGain(); // For headphones/speakers
+        const recorderGain = ctx.createGain(); // For video file (Always 1.0)
+        const dest = ctx.createMediaStreamDestination(); // The Recorder Input
+        
+        // Routing:
+        // Source -> [Connects later to both Gains]
+        
+        // Gain 1 -> Speakers
+        speakerGain.connect(ctx.destination);
+        
+        // Gain 2 -> Recorder
+        recorderGain.gain.value = 1.0; // FIXED VOLUME FOR RECORDING
+        recorderGain.connect(dest);
         
         audioCtxRef.current = ctx;
-        masterGainRef.current = gain;
+        speakerGainRef.current = speakerGain;
+        recorderGainRef.current = recorderGain;
         destNodeRef.current = dest;
     };
     init();
     return () => { audioCtxRef.current?.close(); };
   }, []);
 
+  // Handle Mute (Only affects Speaker Gain, NOT Recorder Gain)
   useEffect(() => {
-    if (masterGainRef.current) masterGainRef.current.gain.value = isMuted ? 0 : 1;
+    if (speakerGainRef.current) {
+        speakerGainRef.current.gain.value = isMuted ? 0 : 1;
+    }
   }, [isMuted]);
 
-  // 2. STITCHING LOGIC (The "Jurisprudence" Fix)
-  // Combine small clips into one continuous 15s/30s track
+  // 2. STITCHING LOGIC (Master Track)
   const createMasterTrack = (buffers: Record<number, AudioBuffer>, scenes: typeof script.scenes) => {
       const ctx = audioCtxRef.current;
       if (!ctx) return null;
 
-      // Calculate total duration exactly based on script
       const totalDuration = scenes.reduce((acc, s) => acc + s.duration, 0);
       const sampleRate = ctx.sampleRate;
       const length = Math.ceil(totalDuration * sampleRate);
       
-      // Create one big empty buffer
-      const master = ctx.createBuffer(1, length, sampleRate); // Mono is safer for consistency
+      const master = ctx.createBuffer(1, length, sampleRate); 
       const channelData = master.getChannelData(0);
 
       let offsetTime = 0;
@@ -83,9 +95,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           if (clip) {
               const clipData = clip.getChannelData(0);
               const startSample = Math.floor(offsetTime * sampleRate);
-              
-              // Copy clip into master, but don't overflow the scene duration
-              // This ensures Scene 2 starts EXACTLY when Scene 1 is supposed to end visually
               const maxSamples = Math.floor(scene.duration * sampleRate);
               const copyLength = Math.min(clipData.length, maxSamples);
               
@@ -113,7 +122,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
               if (!mounted) return;
               try {
                   const url = await getStockImage(s.imageKeyword);
-                  const safeUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`; // Cache bust
+                  const safeUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
                   const img = new Image();
                   img.crossOrigin = "anonymous";
                   img.src = safeUrl;
@@ -163,33 +172,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       const ctx = cvs?.getContext('2d');
       if (!cvs || !ctx) return;
 
-      // Determine current scene based on time
       let t = 0;
       let activeScene = script.scenes[0];
-      let sceneIndex = 0;
-      let sceneProgress = 0; // 0 to 1
+      let sceneProgress = 0;
 
       for (let i = 0; i < script.scenes.length; i++) {
           const s = script.scenes[i];
           if (elapsedTime >= t && elapsedTime < t + s.duration) {
               activeScene = s;
-              sceneIndex = i;
               sceneProgress = (elapsedTime - t) / s.duration;
               break;
           }
           t += s.duration;
       }
 
-      // Draw Logic
       const img = imageCache.current[activeScene.id];
       
-      // Black BG
       ctx.fillStyle = "black";
       ctx.fillRect(0,0,cvs.width, cvs.height);
 
-      // Image with Zoom
       if (img) {
-          const scale = 1 + (sceneProgress * 0.1); // 10% zoom over duration
+          const scale = 1 + (sceneProgress * 0.1); 
           const w = cvs.width * scale;
           const h = cvs.height * scale;
           const x = (cvs.width - w) / 2;
@@ -197,11 +200,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           try { ctx.drawImage(img, x, y, w, h); } catch(e){}
       }
 
-      // Dimmer
       ctx.fillStyle = "rgba(0,0,0,0.3)";
       ctx.fillRect(0,0,cvs.width, cvs.height);
 
-      // Text Overlay
       const cx = cvs.width / 2;
       const cy = cvs.height / 2;
       
@@ -211,17 +212,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       ctx.shadowBlur = 15;
       ctx.textAlign = "center";
       
-      // Title
       ctx.font = "900 48px Inter, sans-serif";
       wrapText(ctx, activeScene.overlayText.toUpperCase(), cx, cy, cvs.width * 0.9, 60);
 
-      // Subtitles (Narration)
       ctx.font = "600 24px Inter, sans-serif";
       wrapSubtitle(ctx, activeScene.narration, cx, cvs.height - 160, cvs.width * 0.85, 34);
       
       ctx.restore();
 
-      // Rec Dot
       if (isRecording) {
           ctx.fillStyle = "red";
           ctx.beginPath();
@@ -230,7 +228,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       }
   };
 
-  // Text Utils
   const wrapText = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, mw: number, lh: number) => {
       const words = text.split(' ');
       let line = '', lines = [];
@@ -266,11 +263,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   // 5. PLAYBACK CONTROLLER
   const startPlayback = async (recordMode: boolean) => {
-      if (!audioCtxRef.current || !masterBufferRef.current) return;
+      if (!audioCtxRef.current || !masterBufferRef.current || !speakerGainRef.current || !recorderGainRef.current) return;
       
       if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
 
-      // Stop previous
       if (activeSourceRef.current) { try{activeSourceRef.current.stop();}catch(e){} }
       if (reqIdRef.current) cancelAnimationFrame(reqIdRef.current);
 
@@ -280,21 +276,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       // Play Master Track
       const src = audioCtxRef.current.createBufferSource();
       src.buffer = masterBufferRef.current;
-      src.connect(masterGainRef.current!);
+      
+      // CONNECT TO BOTH GAINS
+      src.connect(speakerGainRef.current); // To Speakers (Muteable)
+      src.connect(recorderGainRef.current); // To Recorder (Always 1.0)
+      
       src.start(0);
       activeSourceRef.current = src;
       
-      // If recording, we need a keep-alive osc just in case the master track has silence at start
-      let osc: OscillatorNode | null = null;
-      if (recordMode) {
-          osc = audioCtxRef.current.createOscillator();
-          const g = audioCtxRef.current.createGain();
-          g.gain.value = 0.001; 
-          osc.connect(g);
-          g.connect(destNodeRef.current!);
-          osc.start();
-      }
-
       const totalDuration = masterBufferRef.current.duration * 1000;
 
       const loop = () => {
@@ -302,7 +291,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           const elapsed = now - startTimeRef.current;
           
           if (elapsed >= totalDuration) {
-              if (recordMode) stopRecording(osc);
+              if (recordMode) stopRecording();
               else {
                   setIsPlaying(false);
                   if (activeSourceRef.current) { try{activeSourceRef.current.stop();}catch(e){} }
@@ -310,7 +299,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
               return;
           }
 
-          drawFrame(elapsed / 1000); // Pass seconds
+          drawFrame(elapsed / 1000); 
           reqIdRef.current = requestAnimationFrame(loop);
       };
 
@@ -323,9 +312,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       setIsPlaying(false);
   };
 
-  // 6. RECORDING
-  const startRecording = () => {
-      if (!canvasRef.current || !destNodeRef.current) return;
+  // 6. RECORDING (Mix & Download)
+  const startRecording = async () => {
+      if (!canvasRef.current || !destNodeRef.current || !audioCtxRef.current) return;
+      
+      // Warm up Audio Context
+      if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
+
       setIsRecording(true);
       chunksRef.current = [];
 
@@ -343,13 +336,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       rec.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       
       recorderRef.current = rec;
-      rec.start(100); // 100ms slices
+      rec.start(100); 
 
-      startPlayback(true);
+      // Small delay to ensure recorder is "listening" before audio starts
+      setTimeout(() => startPlayback(true), 50);
   };
 
-  const stopRecording = (osc: OscillatorNode | null) => {
-      if (osc) { try{osc.stop();}catch(e){} }
+  const stopRecording = () => {
       if (recorderRef.current && recorderRef.current.state !== 'inactive') {
           recorderRef.current.onstop = saveFile;
           recorderRef.current.stop();
