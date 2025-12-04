@@ -331,7 +331,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       // B. Keep-Alive Oscillator (Fixes Silent Video Bug)
       const osc = audioCtxRef.current.createOscillator();
       const oscGain = audioCtxRef.current.createGain();
-      oscGain.gain.value = 0.001; // Tiny signal to keep track active
+      oscGain.gain.value = 0.005; // Slightly increased gain to ensure track is detected active
       osc.connect(oscGain);
       oscGain.connect(destNodeRef.current);
       osc.start();
@@ -357,7 +357,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
-          a.download = `${script.title}_viral.webm`;
+          a.download = `${script.title.replace(/\s+/g, '_')}_viral.webm`;
           document.body.appendChild(a);
           a.click();
           setTimeout(() => URL.revokeObjectURL(url), 2000);
