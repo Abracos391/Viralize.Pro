@@ -11,8 +11,8 @@ interface VideoPlayerProps {
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest }) => {
   // --- STATE ---
-  const [isReady, setIsReady] = useState(false);         // Assets Loaded?
-  const [hasUserInteracted, setHasUserInteracted] = useState(false); // Audio Unlock?
+  const [isReady, setIsReady] = useState(false);         
+  const [hasUserInteracted, setHasUserInteracted] = useState(false); 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -29,7 +29,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const masterBufferRef = useRef<AudioBuffer | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null); // Recorder Destination
+  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null); 
   
   // Assets Cache
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
@@ -42,7 +42,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         const gain = ctx.createGain();
         const dest = ctx.createMediaStreamDestination();
 
-        // ROUTING: Source -> Gain -> [Speakers AND Recorder]
         gain.connect(ctx.destination);
         gain.connect(dest);
 
@@ -58,13 +57,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (gainNodeRef.current) gainNodeRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
-  // --- 2. ASSET LOADING & STITCHING ---
+  // --- 2. ASSET LOADING ---
   useEffect(() => {
     let mounted = true;
     
     const loadAssets = async () => {
         setIsReady(false);
-        setHasUserInteracted(false); // Reset interaction requirement for new video
+        setHasUserInteracted(false); 
         stopPlayback();
         
         // A. Load Images
@@ -73,7 +72,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         const imgPromises = script.scenes.map(async (scene) => {
             try {
                 let url = await getStockImage(scene.imageKeyword);
-                // Cache busting to prevent Tainted Canvas
                 const safeUrl = url.includes('?') ? `${url}&t=${Date.now()}` : `${url}?t=${Date.now()}`;
                 
                 await new Promise<void>((resolve) => {
@@ -81,12 +79,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                     img.crossOrigin = "anonymous";
                     img.src = safeUrl;
                     img.onload = () => { tempImages[scene.id] = img; resolve(); };
-                    img.onerror = () => { resolve(); }; // Proceed even if fails
+                    img.onerror = () => { resolve(); }; 
                 });
             } catch (e) {}
         });
 
-        // B. Load Audio & Create Master Track
+        // B. Load Audio
         setLoadingStatus("Gerando Narração...");
         const tempAudioBuffers: Record<number, AudioBuffer> = {};
         if (audioCtxRef.current) {
@@ -104,11 +102,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 } catch (e) { console.warn("Audio fail", e); }
             }
 
-            // Stitching (Mixing)
             setLoadingStatus("Mixando Áudio...");
             const totalDuration = script.scenes.reduce((acc, s) => acc + s.duration, 0);
             const sampleRate = ctx.sampleRate;
-            // Add slight buffer to prevent clip at end
             const length = Math.ceil((totalDuration + 0.5) * sampleRate);
             const masterBuf = ctx.createBuffer(1, length, sampleRate);
             const data = masterBuf.getChannelData(0);
@@ -119,7 +115,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 if (clip) {
                     const clipData = clip.getChannelData(0);
                     const startSample = Math.floor(offset * sampleRate);
-                    // Mix clip into master
                     for (let i = 0; i < clipData.length; i++) {
                         if (startSample + i < length) data[startSample + i] = clipData[i];
                     }
@@ -135,7 +130,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
         if (mounted) {
             setLoadingStatus("Pronto");
             setIsReady(true);
-            // Draw first frame
             setTimeout(() => drawFrame(0), 100);
         }
     };
@@ -144,7 +138,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     return () => { mounted = false; stopPlayback(); };
   }, [script]);
 
-  // --- 3. PLAYBACK LOGIC ---
+  // --- 3. PLAYBACK ---
   const stopPlayback = () => {
       if (sourceNodeRef.current) {
           try { sourceNodeRef.current.stop(); } catch(e){}
@@ -157,9 +151,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   const startPlayback = async (forRecording = false) => {
       if (!audioCtxRef.current || !masterBufferRef.current || !gainNodeRef.current) return;
-      
       const ctx = audioCtxRef.current;
-      // CRITICAL: Ensure AudioContext is running
       if (ctx.state === 'suspended') await ctx.resume();
 
       stopPlayback();
@@ -181,7 +173,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
           if (elapsed >= totalDuration) {
               stopPlayback();
-              // If recording, let the onstop handler handle logic
               return;
           }
 
@@ -192,13 +183,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       animationFrameRef.current = requestAnimationFrame(loop);
   };
 
-  // --- 4. RENDERER (Canvas) ---
+  // --- 4. RENDERER ---
   const drawFrame = (elapsed: number) => {
       const cvs = canvasRef.current;
       const ctx = cvs?.getContext('2d');
       if (!cvs || !ctx) return;
 
-      // Determine active scene
       let t = 0;
       let activeScene = script.scenes[0];
       let sceneElapsed = 0;
@@ -211,14 +201,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           t += s.duration;
       }
 
-      // Draw Background
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, cvs.width, cvs.height);
 
-      // Draw Image (Ken Burns)
       const img = imageCache.current[activeScene.id];
       if (img) {
-          const scale = 1 + (sceneElapsed / activeScene.duration) * 0.1; // 10% zoom
+          const scale = 1 + (sceneElapsed / activeScene.duration) * 0.1; 
           const w = cvs.width * scale;
           const h = cvs.height * scale;
           const x = (cvs.width - w) / 2;
@@ -226,11 +214,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           try { ctx.drawImage(img, x, y, w, h); } catch(e){}
       }
 
-      // Overlay Dim
       ctx.fillStyle = "rgba(0,0,0,0.3)";
       ctx.fillRect(0, 0, cvs.width, cvs.height);
 
-      // Helper: Wrap Text
       const drawText = (txt: string, x: number, y: number, size: number, bg: boolean) => {
           ctx.font = `900 ${size}px Inter, sans-serif`;
           ctx.textAlign = "center";
@@ -254,7 +240,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                   const tw = ctx.measureText(l).width;
                   ctx.fillStyle = "rgba(0,0,0,0.6)";
                   ctx.fillRect(x - tw/2 - 10, sy - size * 0.8, tw + 20, size * 1.2);
-                  ctx.fillStyle = "#fbbf24"; // Amber
+                  ctx.fillStyle = "#fbbf24"; 
               } else {
                   ctx.fillStyle = "white";
                   ctx.shadowColor = "black";
@@ -265,15 +251,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           });
       };
 
-      // CLEAN TITLE (No hyphens)
-      const cleanOverlay = activeScene.overlayText.replace(/-/g, ' ').toUpperCase();
+      const cleanOverlay = activeScene.overlayText.replace(/[-_]/g, ' ').toUpperCase();
       drawText(cleanOverlay, cvs.width/2, cvs.height/2, 52, false);
 
-      // CAPTIONS
       ctx.font = "bold 28px Inter, sans-serif";
       drawText(activeScene.narration, cvs.width/2, cvs.height - 150, 28, true);
 
-      // Recording Dot
       if (isProcessing) {
           ctx.fillStyle = "red";
           ctx.beginPath();
@@ -282,30 +265,26 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       }
   };
 
-  // --- 5. RECORDING HANDLER ---
+  // --- 5. DOWNLOAD HANDLER ---
   const handleDownload = async () => {
       if (!isReady || !audioCtxRef.current || !destNodeRef.current || !canvasRef.current) return;
       
-      // Ensure Audio Context is active
       if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
 
-      // KEEP-ALIVE OSCILLATOR (Fixes Silent Video Bug)
+      // KEEP-ALIVE OSCILLATOR (Critical Fix)
       const osc = audioCtxRef.current.createOscillator();
       const oscGain = audioCtxRef.current.createGain();
-      oscGain.gain.value = 0.001; // Inaudible but active
+      oscGain.gain.value = 0.001; 
       osc.connect(oscGain);
       oscGain.connect(destNodeRef.current);
       osc.start();
 
-      // Start Playback for Recording
       await startPlayback(true);
 
-      // Setup Streams
       const videoStream = canvasRef.current.captureStream(30);
       const audioStream = destNodeRef.current.stream;
       const combined = new MediaStream([...videoStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
 
-      // MimeType Sniffing
       const mime = MediaRecorder.isTypeSupported("video/webm; codecs=vp9") ? "video/webm; codecs=vp9" : "video/webm";
       const recorder = new MediaRecorder(combined, { mimeType: mime });
       
@@ -313,12 +292,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
       
       recorder.onstop = () => {
-          osc.stop(); // Stop keep-alive
+          osc.stop(); 
           const blob = new Blob(chunks, { type: "video/webm" });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
           a.href = url;
-          // Clean filename
           const filename = script.title.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
           a.download = `${filename}_viral.webm`;
           document.body.appendChild(a);
@@ -326,7 +304,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
           setTimeout(() => URL.revokeObjectURL(url), 2000);
       };
 
-      // Stop recorder when playback stops
       const checkEnd = setInterval(() => {
           if (!isPlaying && !sourceNodeRef.current) {
               if (recorder.state === "recording") recorder.stop();
@@ -345,10 +322,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
 
   return (
     <div className="flex flex-col lg:flex-row gap-8 items-start justify-center max-w-7xl mx-auto">
-        {/* PREVIEW CONTAINER */}
         <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-[3rem] border-[8px] border-gray-800 shadow-2xl overflow-hidden group">
             
-            {/* CLICK TO START OVERLAY (Audio Unlock) */}
             {isReady && !hasUserInteracted && (
                 <div onClick={handleInteract} className="absolute inset-0 z-50 bg-black/80 flex flex-col items-center justify-center cursor-pointer hover:bg-black/70 transition">
                     <PlayCircle size={64} className="text-brand-500 mb-4 animate-pulse" />
@@ -357,7 +332,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 </div>
             )}
 
-            {/* LOADING OVERLAY */}
             {!isReady && (
                 <div className="absolute inset-0 z-40 bg-gray-900 flex flex-col items-center justify-center">
                     <Loader2 className="animate-spin text-brand-500 mb-4" size={32} />
@@ -368,10 +342,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             <canvas ref={canvasRef} width={540} height={960} className="w-full h-full object-cover" />
         </div>
 
-        {/* CONTROLS */}
         <div className="flex-1 w-full space-y-6">
             <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6 backdrop-blur-xl">
-                <h3 className="text-2xl font-bold text-white mb-2">{script.title.replace(/-/g, ' ')}</h3>
+                <h3 className="text-2xl font-bold text-white mb-2">{script.title.replace(/[-_]/g, ' ')}</h3>
                 
                 <div className="flex gap-4 mb-6">
                     <button 
