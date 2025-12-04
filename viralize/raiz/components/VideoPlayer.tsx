@@ -64,6 +64,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
       if (gainNodeRef.current) gainNodeRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
+  // Helper to ensure Audio Context is active (Chrome Autoplay Policy)
+  const ensureAudioActive = async () => {
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+          await audioCtxRef.current.resume();
+      }
+  };
+
   // 2. HELPER: CREATE MASTER AUDIO TRACK (STITCHING)
   const createMasterTrack = async (clips: Record<number, AudioBuffer>) => {
       if (!audioCtxRef.current) return null;
@@ -170,8 +177,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   };
 
   const startPlayback = async (recording = false) => {
+      await ensureAudioActive();
+      
       if (!audioCtxRef.current || !gainNodeRef.current || !masterAudioBufferRef.current) return;
-      if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
 
       stopPlayback();
       setIsPlaying(true);
@@ -314,6 +322,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const handleDownload = async () => {
       if (!canvasRef.current || !audioCtxRef.current || !destNodeRef.current) return;
       
+      await ensureAudioActive();
+
       // A. Setup Streams
       const canvasStream = canvasRef.current.captureStream(30);
       const audioStream = destNodeRef.current.stream;
@@ -373,7 +383,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
                 <div className="absolute inset-0 z-40 bg-black/80 flex flex-col items-center justify-center">
                     <div className="w-16 h-16 border-4 border-red-500 border-t-transparent rounded-full animate-spin mb-4" />
                     <p className="text-white font-bold">Recording Video...</p>
-                    <p className="text-xs text-gray-400">Please wait</p>
+                    <p className="text-xs text-gray-400">Do not close window</p>
                 </div>
             )}
 
