@@ -4,140 +4,142 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegPath from 'ffmpeg-static';
-import bodyParser from 'body-parser';
 import cors from 'cors';
+import multer from 'multer';
 
-// CONFIGURAÇÃO DO AMBIENTE
+// 1. CONFIGURAÇÃO DO SERVIDOR
 const app = express();
 const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// CONFIGURAR FFMPEG (O Segredo do Manus)
-// Usa o binário estático baixado pelo npm, funciona no Render/Linux/Windows
+// CONFIGURAR ENGINE
 if (ffmpegPath) {
     ffmpeg.setFfmpegPath(ffmpegPath);
-    console.log(`FFmpeg binário configurado: ${ffmpegPath}`);
-} else {
-    console.error("ERRO CRÍTICO: ffmpeg-static não encontrado.");
+    console.log(`[System] Engine de Vídeo Pronto: ${ffmpegPath}`);
 }
 
-// MIDDLEWARE
 app.use(cors());
-// Aumentar limites para aceitar upload de imagens HD + Áudio
-app.use(bodyParser.json({ limit: '200mb' })); 
-app.use(bodyParser.urlencoded({ extended: true, limit: '200mb' }));
+app.use(express.json()); // JSON apenas para metadados pequenos
 
-// DIRETÓRIOS
+// 2. SISTEMA DE ARQUIVOS (Staging Area)
 let DIST_DIR = path.join(__dirname, 'dist');
-// Fallback para encontrar a pasta dist
-if (!fs.existsSync(DIST_DIR)) {
-    DIST_DIR = path.join(process.cwd(), 'dist');
-}
+if (!fs.existsSync(DIST_DIR)) DIST_DIR = path.join(process.cwd(), 'dist');
 
-const TEMP_DIR = path.join(process.cwd(), 'temp_render');
+const UPLOADS_DIR = path.join(process.cwd(), 'temp_uploads');
 const OUTPUT_DIR = path.join(process.cwd(), 'public_videos');
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-// SERVIR ARQUIVOS ESTÁTICOS (Frontend)
-app.use(express.static(DIST_DIR));
+// Configuração do Multer (Upload Manager)
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        // Cria uma pasta única por Job para não misturar arquivos
+        const jobId = req.body.jobId || 'unknown_job';
+        const jobDir = path.join(UPLOADS_DIR, jobId);
+        if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
+        cb(null, jobDir);
+    },
+    filename: (req, file, cb) => {
+        // Mantém o nome original que o frontend enviou (ex: frame_0.jpg, audio.wav)
+        cb(null, file.originalname);
+    }
+});
+const upload = multer({ storage: storage });
 
-// ROTA PARA SERVIR VÍDEOS GERADOS
+// Servir arquivos
+app.use(express.static(DIST_DIR));
 app.use('/videos', express.static(OUTPUT_DIR));
 
-// --- API DE RENDERIZAÇÃO (Server-Side Mixing) ---
-app.post('/api/render', async (req, res) => {
-    const { script, audioBase64, imagesBase64 } = req.body;
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const jobDir = path.join(TEMP_DIR, jobId);
+// 3. API: ROTA DE UPLOAD E RENDERIZAÇÃO
+// Recebe todos os arquivos de uma vez via FormData
+app.post('/api/render-job', upload.any(), async (req, res) => {
+    const { jobId, scriptJson } = req.body;
     
-    console.log(`[Job ${jobId}] Iniciando renderização... Cenas: ${script.scenes.length}`);
+    if (!jobId || !req.files || req.files.length === 0) {
+        return res.status(400).json({ success: false, error: "Nenhum arquivo recebido." });
+    }
 
+    console.log(`[Job ${jobId}] 📦 Arquivos recebidos no servidor (Staging). Iniciando mixagem...`);
+
+    const jobDir = path.join(UPLOADS_DIR, jobId);
+    const outputFileName = `video_${jobId}.mp4`;
+    const outputPath = path.join(OUTPUT_DIR, outputFileName);
+    
     try {
-        if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
+        const script = JSON.parse(scriptJson);
+        const imagesCount = script.scenes.length;
 
-        // 1. SALVAR ÁUDIO (Master Track)
-        const audioPath = path.join(jobDir, 'audio.wav');
-        // Remover cabeçalho data URI se existir
-        const audioData = audioBase64.split(';base64,').pop();
-        fs.writeFileSync(audioPath, Buffer.from(audioData, 'base64'));
-        console.log(`[Job ${jobId}] Áudio mestre salvo.`);
-
-        // 2. SALVAR IMAGENS (Frames visuais com texto já queimado pelo frontend)
-        const imageListPath = path.join(jobDir, 'images.txt');
+        // A. Preparar Lista de Concatenação para FFmpeg
+        const listPath = path.join(jobDir, 'inputs.txt');
         let fileContent = '';
         
-        for (let i = 0; i < script.scenes.length; i++) {
-            const scene = script.scenes[i];
-            const imgData = imagesBase64[i].split(';base64,').pop();
-            const imgPath = path.join(jobDir, `frame_${i}.jpg`);
+        // Ordenar e listar imagens
+        for (let i = 0; i < imagesCount; i++) {
+            const imgName = `frame_${i}.jpg`;
+            const imgPath = path.join(jobDir, imgName);
             
-            fs.writeFileSync(imgPath, Buffer.from(imgData, 'base64'));
-            
-            // Formato Concat do FFmpeg
-            // file 'caminho'
-            // duration segundos
+            // Verificação de segurança
+            if (!fs.existsSync(imgPath)) throw new Error(`Frame ${i} faltando no upload.`);
+
+            const duration = script.scenes[i].duration;
             fileContent += `file '${imgPath}'\n`;
-            fileContent += `duration ${scene.duration}\n`;
+            fileContent += `duration ${duration}\n`;
         }
+        // Bugfix FFmpeg: Repetir último frame
+        fileContent += `file '${path.join(jobDir, `frame_${imagesCount-1}.jpg`)}'\n`;
         
-        // Repetir o último frame para fechar o stream corretamente
-        const lastImgPath = path.join(jobDir, `frame_${script.scenes.length - 1}.jpg`);
-        fileContent += `file '${lastImgPath}'\n`;
-
-        fs.writeFileSync(imageListPath, fileContent);
-        console.log(`[Job ${jobId}] Frames visuais salvos.`);
-
-        // 3. EXECUTAR FFMPEG (Mixagem Final)
-        const outputFileName = `video_${jobId}.mp4`;
-        const outputPath = path.join(OUTPUT_DIR, outputFileName);
+        fs.writeFileSync(listPath, fileContent);
         
+        // B. Localizar Áudio
+        const audioPath = path.join(jobDir, 'audio.wav');
+        if (!fs.existsSync(audioPath)) throw new Error("Arquivo de áudio mestre faltando.");
+
+        // C. Executar FFmpeg (Mixagem)
         await new Promise((resolve, reject) => {
             ffmpeg()
-                .input(imageListPath)
+                .input(listPath)
                 .inputOptions(['-f', 'concat', '-safe', '0'])
                 .input(audioPath)
                 .outputOptions([
-                    '-c:v libx264',       // Codec de vídeo universal
-                    '-pix_fmt yuv420p',   // Compatibilidade máxima (Windows/QuickTime)
-                    '-vf scale=1080:1920', // Garantir resolução vertical
-                    '-c:a aac',           // Codec de áudio padrão MP4
-                    '-b:a 192k',          // Qualidade de áudio
-                    '-shortest',          // Cortar vídeo quando o áudio acabar (ou vice-versa)
-                    '-r 30'               // 30 FPS fixo
+                    '-map 0:v',           // Vídeo das imagens
+                    '-map 1:a',           // Áudio do WAV
+                    '-c:v libx264',       // Codec H.264
+                    '-pix_fmt yuv420p',   // Pixel format compatível
+                    '-vf scale=1080:1920',// Resolução Vertical
+                    '-c:a aac',           // Áudio AAC
+                    '-b:a 192k',          // Bitrate
+                    '-ac 2',              // Estéreo
+                    '-shortest',          // Cortar excessos
+                    '-r 30'               // 30 FPS
                 ])
                 .save(outputPath)
-                .on('start', (cmd) => console.log(`[Job ${jobId}] FFmpeg Cmd: ${cmd}`))
-                .on('end', () => resolve())
-                .on('error', (err) => reject(err));
+                .on('end', resolve)
+                .on('error', reject);
         });
 
-        console.log(`[Job ${jobId}] Renderização concluída!`);
-        
-        // Limpeza síncrona dos arquivos temporários para economizar espaço
-        try {
-            fs.rmSync(jobDir, { recursive: true, force: true });
-        } catch (e) { console.warn("Erro ao limpar temp:", e); }
+        console.log(`[Job ${jobId}] ✅ Vídeo Gerado: ${outputFileName}`);
 
-        // Retornar URL pública
+        // Limpeza (Opcional - pode remover depois)
+        // fs.rmSync(jobDir, { recursive: true, force: true });
+
         res.json({ success: true, url: `/videos/${outputFileName}` });
 
     } catch (error) {
-        console.error(`[Job ${jobId}] FALHA FATAL:`, error);
-        res.status(500).json({ success: false, error: error.message || "Erro interno de renderização" });
+        console.error(`[Job ${jobId}] ❌ Falha:`, error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// FALLBACK ROUTE
+// Fallback
 app.get('*', (req, res) => {
-  const indexPath = path.join(DIST_DIR, 'index.html');
-  if (fs.existsSync(indexPath)) res.sendFile(indexPath);
-  else res.send("Servidor rodando. Aguardando build do frontend.");
+    const index = path.join(DIST_DIR, 'index.html');
+    if (fs.existsSync(index)) res.sendFile(index);
+    else res.send("Server Online. Building Frontend...");
 });
 
 app.listen(PORT, () => {
-  console.log(`Servidor Viralize Pro (API + Frontend) rodando na porta ${PORT}`);
-  console.log(`Diretório de trabalho: ${process.cwd()}`);
+    console.log(`🚀 SERVIDOR DE RENDERIZAÇÃO ATIVO NA PORTA ${PORT}`);
+    console.log(`📂 Staging Dir: ${UPLOADS_DIR}`);
 });
