@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import React, { useState, useEffect, useRef } from 'react';
 import { GeneratedScript } from '../types';
-import { Play, Pause, Volume2, VolumeX, Download, Loader2, PlayCircle, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Loader2, PlayCircle, CloudLightning, Download } from 'lucide-react';
 import { generateNarration, getStockImage } from '../services/geminiService';
 
 interface VideoPlayerProps {
@@ -15,23 +15,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const [hasUserInteracted, setHasUserInteracted] = useState(false); 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false); // Renderizando no servidor
   const [loadingStatus, setLoadingStatus] = useState("Iniciando...");
   const [progress, setProgress] = useState(0);
+  const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
 
   // --- REFS ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationFrameRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(0);
   
-  // Audio Refs
+  // Audio & Assets
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const masterBufferRef = useRef<AudioBuffer | null>(null); // THE MASTER TRACK
+  const masterBufferRef = useRef<AudioBuffer | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null); 
-  
-  // Asset Cache
   const imageCache = useRef<Record<number, HTMLImageElement>>({});
 
   // --- 1. INITIALIZE AUDIO ENGINE ---
@@ -41,18 +39,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
             const AudioContextClass = (window as any).AudioContext || (window as any).webkitAudioContext;
             const ctx = new AudioContextClass();
             const gain = ctx.createGain();
-            const dest = ctx.createMediaStreamDestination();
-
-            gain.connect(ctx.destination); // For Hearing
-            gain.connect(dest);            // For Recording
-
+            gain.connect(ctx.destination);
             audioCtxRef.current = ctx;
             gainNodeRef.current = gain;
-            destNodeRef.current = dest;
-            console.log("Audio Engine Ready");
-        } catch (e) {
-            console.error("Audio Init Failed", e);
-        }
+        } catch (e) { console.error(e); }
     };
     initAudio();
     return () => { audioCtxRef.current?.close(); };
@@ -62,307 +52,292 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
     if (gainNodeRef.current) gainNodeRef.current.gain.value = isMuted ? 0 : 1;
   }, [isMuted]);
 
-  // --- 2. ASSET LOADING & OFFLINE MIXING ---
+  // --- HELPER: AUDIO BUFFER TO BASE64 (WAV) ---
+  const audioBufferToWavBase64 = (buffer: AudioBuffer): string => {
+      const numOfChan = 1;
+      const length = buffer.length * numOfChan * 2 + 44;
+      const bufferArr = new ArrayBuffer(length);
+      const view = new DataView(bufferArr);
+      const channels = [];
+      let i;
+      let sample;
+      let offset = 0;
+      let pos = 0;
+
+      // write WAVE header
+      setUint32(0x46464952);                         // "RIFF"
+      setUint32(length - 8);                         // file length - 8
+      setUint32(0x45564157);                         // "WAVE"
+      setUint32(0x20746d66);                         // "fmt " chunk
+      setUint32(16);                                 // length = 16
+      setUint16(1);                                  // PCM (uncompressed)
+      setUint16(numOfChan);
+      setUint32(buffer.sampleRate);
+      setUint32(buffer.sampleRate * 2 * numOfChan);  // avg. bytes/sec
+      setUint16(numOfChan * 2);                      // block-align
+      setUint16(16);                                 // 16-bit 
+      setUint32(0x61746164);                         // "data" - chunk
+      setUint32(length - pos - 4);                   // chunk length
+
+      for(i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
+
+      while(pos < buffer.length) {
+          for(i = 0; i < numOfChan; i++) {
+              sample = Math.max(-1, Math.min(1, channels[i][pos])); 
+              sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767)|0; 
+              view.setInt16(44 + offset, sample, true); 
+              offset += 2;
+          }
+          pos++;
+      }
+
+      function setUint16(data: any) { view.setUint16(pos, data, true); pos += 2; }
+      function setUint32(data: any) { view.setUint32(pos, data, true); pos += 4; }
+
+      let binary = '';
+      const bytes = new Uint8Array(bufferArr);
+      const len = bytes.byteLength;
+      for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+      return "data:audio/wav;base64," + window.btoa(binary);
+  }
+
+  // --- 2. LOAD ASSETS ---
   useEffect(() => {
     let mounted = true;
-    
     const loadAssets = async () => {
         setIsReady(false);
         setHasUserInteracted(false); 
-        stopPlayback();
+        setFinalVideoUrl(null);
         
         // A. Load Images
-        setLoadingStatus("Baixando Imagens...");
+        setLoadingStatus("Carregando Imagens...");
         const tempImages: Record<number, HTMLImageElement> = {};
-        const imgPromises = script.scenes.map(async (scene) => {
-            try {
-                let url = await getStockImage(scene.imageKeyword);
-                // Cache Busting vital for Tainted Canvas
-                const safeUrl = url.includes('?') ? `${url}&t=${Date.now()}` : `${url}?t=${Date.now()}`;
-                
-                await new Promise<void>((resolve) => {
-                    const img = new Image();
-                    img.crossOrigin = "anonymous"; // CRITICAL
-                    img.src = safeUrl;
-                    img.onload = () => { tempImages[scene.id] = img; resolve(); };
-                    img.onerror = () => { resolve(); }; // Fail safe
-                });
-            } catch (e) {}
-        });
+        
+        for (const scene of script.scenes) {
+             let url = "";
+             try { url = await getStockImage(scene.imageKeyword); } 
+             catch { url = `https://picsum.photos/seed/${scene.imageKeyword}/1080/1920`; }
+             
+             // Bypass cache para garantir que não tenhamos canvas "sujo"
+             const safeUrl = `${url}?t=${Date.now()}`;
 
-        // B. Load & Mix Audio (THE KEY FIX)
-        setLoadingStatus("Gerando Áudio...");
+             await new Promise<void>((resolve) => {
+                const img = new Image();
+                img.crossOrigin = "anonymous"; // CRUCIAL para poder exportar a imagem depois
+                img.src = safeUrl;
+                img.onload = () => { tempImages[scene.id] = img; resolve(); };
+                img.onerror = () => resolve();
+             });
+        }
+        imageCache.current = tempImages;
+
+        // B. Mix Audio
+        setLoadingStatus("Gerando Voz...");
         if (audioCtxRef.current) {
             const ctx = audioCtxRef.current;
             const tempBuffers: Record<number, AudioBuffer> = {};
 
-            // 1. Fetch all clips
             for (const scene of script.scenes) {
                 try {
-                    setLoadingStatus(`Gerando Áudio ${scene.id}/${script.scenes.length}...`);
                     const b64 = await generateNarration(scene.narration);
                     if (b64 !== "SILENCE") {
                         const bin = atob(b64);
                         const bytes = new Uint8Array(bin.length);
                         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                        const buf = await ctx.decodeAudioData(bytes.buffer);
+                        tempBuffers[scene.id] = await ctx.decodeAudioData(bytes.buffer);
+                    } else {
+                        const len = ctx.sampleRate * scene.duration;
+                        const buf = ctx.createBuffer(1, len, ctx.sampleRate);
                         tempBuffers[scene.id] = buf;
                     }
-                } catch (e) { console.warn("Audio Clip Failed", e); }
+                } catch (e) { console.warn("Audio fail", e); }
             }
 
-            // 2. OFFLINE RENDERING (Mixer)
-            // This creates a single mathematically perfect WAV buffer
-            setLoadingStatus("Mixando Faixa Mestra...");
+            setLoadingStatus("Mixando...");
             const totalDuration = script.scenes.reduce((acc, s) => acc + s.duration, 0);
-            
-            // Create Offline Context
             const OfflineCtx = (window as any).OfflineAudioContext || (window as any).webkitOfflineAudioContext;
-            // 44100Hz is most compatible
             const offlineCtx = new OfflineCtx(1, Math.ceil(totalDuration * 44100), 44100);
             
-            let offsetTime = 0;
-            script.scenes.forEach((scene) => {
-                const buffer = tempBuffers[scene.id];
-                if (buffer) {
-                    const source = offlineCtx.createBufferSource();
-                    source.buffer = buffer;
-                    source.connect(offlineCtx.destination);
-                    source.start(offsetTime);
+            let offset = 0;
+            script.scenes.forEach(s => {
+                const buf = tempBuffers[s.id];
+                if (buf) {
+                    const src = offlineCtx.createBufferSource();
+                    src.buffer = buf;
+                    src.connect(offlineCtx.destination);
+                    src.start(offset);
                 }
-                offsetTime += scene.duration;
+                offset += s.duration;
             });
 
-            // Render the Master Track
-            const renderedBuffer = await offlineCtx.startRendering();
-            masterBufferRef.current = renderedBuffer;
-            console.log("Master Track Created:", renderedBuffer.duration, "seconds");
+            masterBufferRef.current = await offlineCtx.startRendering();
         }
-
-        await Promise.all(imgPromises);
-        imageCache.current = tempImages;
 
         if (mounted) {
             setLoadingStatus("Pronto");
             setIsReady(true);
-            setTimeout(() => drawFrame(0), 100);
+            setTimeout(() => drawPreviewFrame(0), 100);
         }
     };
-
     loadAssets();
-    return () => { mounted = false; stopPlayback(); };
+    return () => { mounted = false; };
   }, [script]);
 
-  // --- 3. PLAYBACK ENGINE ---
-  const stopPlayback = () => {
-      if (sourceNodeRef.current) {
-          try { sourceNodeRef.current.stop(); } catch(e){}
-          sourceNodeRef.current = null;
+  // --- 3. CANVAS HELPERS ---
+  const drawSceneToContext = (ctx: CanvasRenderingContext2D, sceneIdx: number, width: number, height: number) => {
+      const scene = script.scenes[sceneIdx];
+      
+      // BG
+      ctx.fillStyle = "black";
+      ctx.fillRect(0,0,width,height);
+      
+      // Img
+      const img = imageCache.current[scene.id];
+      if (img) {
+          // Object-cover logic
+          const scale = Math.max(width / img.width, height / img.height);
+          const x = (width / 2) - (img.width / 2) * scale;
+          const y = (height / 2) - (img.height / 2) * scale;
+          ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
       }
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      setIsPlaying(false);
-      setIsProcessing(false);
+
+      // Overlay Dim
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.fillRect(0,0,width,height);
+
+      // Text Overlay
+      const fontSizeTitle = Math.floor(width * 0.08); // Responsive font
+      ctx.font = `900 ${fontSizeTitle}px sans-serif`;
+      ctx.fillStyle = "white";
+      ctx.textAlign = "center";
+      ctx.shadowColor = "black";
+      ctx.shadowBlur = 10;
+      
+      // Simple text wrap for title
+      const words = scene.overlayText.toUpperCase().split(' ');
+      let line = '';
+      let y = height / 2;
+      for(let n=0; n<words.length; n++) {
+        const testLine = line + words[n] + ' ';
+        const metrics = ctx.measureText(testLine);
+        if (metrics.width > width * 0.9 && n > 0) {
+            ctx.fillText(line, width/2, y);
+            line = words[n] + ' ';
+            y += fontSizeTitle * 1.2;
+        } else {
+            line = testLine;
+        }
+      }
+      ctx.fillText(line, width/2, y);
+
+      // Subtitles (Bottom)
+      const fontSizeSub = Math.floor(width * 0.05);
+      ctx.font = `bold ${fontSizeSub}px sans-serif`;
+      ctx.fillStyle = "#fbbf24";
+      ctx.fillText(scene.narration.substring(0, 50) + "...", width/2, height - (height * 0.1));
   };
 
-  const startPlayback = async (forRecording = false) => {
-      if (!audioCtxRef.current || !masterBufferRef.current || !gainNodeRef.current) {
-          alert("Erro: Áudio não inicializado. Recarregue a página.");
-          return;
+  const drawPreviewFrame = (elapsed: number) => {
+      const cvs = canvasRef.current;
+      const ctx = cvs?.getContext('2d');
+      if (!cvs || !ctx) return;
+
+      let t = 0;
+      let activeIdx = 0;
+      for (let i=0; i<script.scenes.length; i++) {
+          const s = script.scenes[i];
+          if (elapsed >= t && elapsed < t + s.duration) { activeIdx = i; break; }
+          t += s.duration;
       }
-      
+      drawSceneToContext(ctx, activeIdx, cvs.width, cvs.height);
+  };
+
+  // --- 4. PREVIEW PLAYBACK ---
+  const startPlayback = async () => {
+      if (!audioCtxRef.current || !masterBufferRef.current) return;
       const ctx = audioCtxRef.current;
       if (ctx.state === 'suspended') await ctx.resume();
 
-      stopPlayback();
-      setIsPlaying(true);
-      if (forRecording) setIsProcessing(true);
-
-      // Play Master Track
+      if (sourceNodeRef.current) try{sourceNodeRef.current.stop()}catch(e){}
+      
       const source = ctx.createBufferSource();
       source.buffer = masterBufferRef.current;
-      source.connect(gainNodeRef.current);
+      source.connect(gainNodeRef.current!);
       source.start(0);
       sourceNodeRef.current = source;
-
+      
+      setIsPlaying(true);
       startTimeRef.current = Date.now();
-      const totalDuration = script.scenes.reduce((acc, s) => acc + s.duration, 0);
+      const totalDuration = masterBufferRef.current.duration;
 
-      // Animation Loop
       const loop = () => {
-          const now = Date.now();
-          const elapsed = (now - startTimeRef.current) / 1000;
-
+          const elapsed = (Date.now() - startTimeRef.current) / 1000;
           if (elapsed >= totalDuration) {
-              if (!forRecording) stopPlayback();
-              // If recording, recorder.onstop handles state
+              setIsPlaying(false);
               return;
           }
-
           setProgress(elapsed / totalDuration);
-          drawFrame(elapsed);
+          drawPreviewFrame(elapsed);
           animationFrameRef.current = requestAnimationFrame(loop);
       };
       animationFrameRef.current = requestAnimationFrame(loop);
   };
 
-  // --- 4. VISUAL RENDERER ---
-  const drawFrame = (elapsed: number) => {
-      const cvs = canvasRef.current;
-      const ctx = cvs?.getContext('2d');
-      if (!cvs || !ctx) return;
-
-      // Find Active Scene
-      let t = 0;
-      let activeScene = script.scenes[0];
-      let sceneElapsed = 0;
-      for (let s of script.scenes) {
-          if (elapsed >= t && elapsed < t + s.duration) {
-              activeScene = s;
-              sceneElapsed = elapsed - t;
-              break;
-          }
-          t += s.duration;
-      }
-
-      // Background
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, cvs.width, cvs.height);
-
-      // Image with Ken Burns
-      const img = imageCache.current[activeScene.id];
-      if (img) {
-          const scale = 1 + (sceneElapsed / activeScene.duration) * 0.1; 
-          const w = cvs.width * scale;
-          const h = cvs.height * scale;
-          const x = (cvs.width - w) / 2;
-          const y = (cvs.height - h) / 2;
-          try { ctx.drawImage(img, x, y, w, h); } catch(e){}
-      }
-
-      // Overlay
-      ctx.fillStyle = "rgba(0,0,0,0.3)";
-      ctx.fillRect(0, 0, cvs.width, cvs.height);
-
-      // Text Drawing Helper
-      const drawText = (txt: string, x: number, y: number, size: number, bg: boolean) => {
-          ctx.font = `900 ${size}px Inter, sans-serif`;
-          ctx.textAlign = "center";
-          const maxWidth = cvs.width * 0.9;
-          const words = txt.split(' ');
-          let line = '';
-          const lines = [];
-
-          for (let n = 0; n < words.length; n++) {
-              const test = line + words[n] + ' ';
-              if (ctx.measureText(test).width > maxWidth && n > 0) { lines.push(line); line = words[n] + ' '; }
-              else { line = test; }
-          }
-          lines.push(line);
-
-          const lh = size * 1.2;
-          let sy = y - ((lines.length - 1) * lh) / 2;
-          
-          lines.forEach(l => {
-              if (bg) {
-                  const tw = ctx.measureText(l).width;
-                  ctx.fillStyle = "rgba(0,0,0,0.6)";
-                  ctx.fillRect(x - tw/2 - 10, sy - size * 0.8, tw + 20, size * 1.2);
-                  ctx.fillStyle = "#fbbf24"; 
-              } else {
-                  ctx.fillStyle = "white";
-                  ctx.shadowColor = "black";
-                  ctx.shadowBlur = 10;
-              }
-              ctx.fillText(l, x, sy);
-              sy += lh;
-          });
-      };
-
-      // Titles & Subtitles
-      const cleanOverlay = activeScene.overlayText.replace(/[-_]/g, ' ').toUpperCase();
-      drawText(cleanOverlay, cvs.width/2, cvs.height/2, 52, false);
-
-      ctx.font = "bold 28px Inter, sans-serif";
-      drawText(activeScene.narration, cvs.width/2, cvs.height - 150, 28, true);
-
-      // Recording Indicator
-      if (isProcessing) {
-          ctx.fillStyle = "red";
-          ctx.beginPath();
-          ctx.arc(40, 40, 15, 0, Math.PI*2);
-          ctx.fill();
-      }
-  };
-
-  // --- 5. NATIVE RECORDING (The "Mixer") ---
-  const handleDownload = async () => {
-      if (!isReady || !audioCtxRef.current || !destNodeRef.current || !canvasRef.current) return;
+  // --- 5. SERVER RENDER (GENERATE PAYLOAD) ---
+  const handleServerRender = async () => {
+      if (!masterBufferRef.current) return;
+      setIsProcessing(true);
       
       try {
-        if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
+          // A. Convert Master Audio to Base64
+          const wavBase64 = audioBufferToWavBase64(masterBufferRef.current);
+          
+          // B. Generate Image Frames (With Text Burned In)
+          const imagesBase64: string[] = [];
+          
+          // Create a temp canvas for HD rendering
+          const renderCanvas = document.createElement('canvas');
+          renderCanvas.width = 1080;
+          renderCanvas.height = 1920;
+          const ctx = renderCanvas.getContext('2d');
+          
+          if (!ctx) throw new Error("Canvas init failed");
 
-        // 1. SILENT OSCILLATOR (Prevents "No Audio" bug in Chrome)
-        // This keeps the audio track active even if the master track has tiny gaps (it shouldn't)
-        const osc = audioCtxRef.current.createOscillator();
-        const oscGain = audioCtxRef.current.createGain();
-        oscGain.gain.value = 0.001; // Inaudible
-        osc.connect(oscGain);
-        oscGain.connect(destNodeRef.current);
-        osc.start();
+          for (let i=0; i<script.scenes.length; i++) {
+              drawSceneToContext(ctx, i, 1080, 1920);
+              // Export as JPEG (lighter than PNG)
+              imagesBase64.push(renderCanvas.toDataURL('image/jpeg', 0.85));
+          }
 
-        // 2. START PLAYBACK (Visuals + Master Audio)
-        await startPlayback(true);
+          // C. Send to Backend
+          const response = await fetch('/api/render', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                  script: script,
+                  imagesBase64: imagesBase64, // Array of data:image/jpeg;base64,...
+                  audioBase64: wavBase64     // data:audio/wav;base64,...
+              })
+          });
 
-        // 3. CAPTURE STREAMS
-        const videoStream = canvasRef.current.captureStream(30);
-        const audioStream = destNodeRef.current.stream;
-        const combined = new MediaStream([...videoStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
-
-        // 4. CODEC SNIFFING
-        let mime = "video/webm";
-        if (MediaRecorder.isTypeSupported("video/webm; codecs=vp9")) mime = "video/webm; codecs=vp9";
-        else if (MediaRecorder.isTypeSupported("video/mp4")) mime = "video/mp4";
-
-        const recorder = new MediaRecorder(combined, { mimeType: mime });
-        const chunks: Blob[] = [];
-
-        recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-        
-        recorder.onstop = () => {
-            osc.stop(); 
-            const blob = new Blob(chunks, { type: mime });
-            
-            // Check if file is valid
-            if (blob.size < 1000) {
-                alert("Erro: Gravação falhou (Arquivo vazio). Tente novamente.");
-                setIsProcessing(false);
-                return;
-            }
-
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            const filename = script.title.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
-            a.download = `${filename}_viral.webm`;
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => URL.revokeObjectURL(url), 2000);
-            
-            setIsProcessing(false);
-        };
-
-        // 5. STOP CHECKER
-        // Since play stops automatically via animation loop, we poll to stop recorder
-        const totalDuration = script.scenes.reduce((acc, s) => acc + s.duration, 0) * 1000;
-        
-        recorder.start();
-        
-        setTimeout(() => {
-            if (recorder.state === 'recording') recorder.stop();
-        }, totalDuration + 500); // 500ms buffer
+          if (!response.ok) {
+              const err = await response.text();
+              throw new Error("Erro no Servidor: " + err);
+          }
+          
+          const data = await response.json();
+          if (data.success && data.url) {
+              setFinalVideoUrl(data.url);
+              // Auto download trigger
+              window.location.href = data.url; 
+          } else {
+              throw new Error(data.error || "Unknown Error");
+          }
 
       } catch (e: any) {
-          alert("Erro no Download: " + e.message);
+          alert("Render Falhou: " + e.message);
+          console.error(e);
+      } finally {
           setIsProcessing(false);
       }
   };
@@ -370,72 +345,61 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ script, onEditRequest 
   const handleInteract = () => {
       if (audioCtxRef.current) audioCtxRef.current.resume();
       setHasUserInteracted(true);
-      startPlayback(false);
+      startPlayback();
   };
 
   return (
     <div className="flex flex-col lg:flex-row gap-8 items-start justify-center max-w-7xl mx-auto">
-        {/* VIEWPORT */}
-        <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-[3rem] border-[8px] border-gray-800 shadow-2xl overflow-hidden group">
-            
-            {/* OVERLAY: CLICK TO START (Mandatory for Audio) */}
-            {isReady && !hasUserInteracted && (
-                <div onClick={handleInteract} className="absolute inset-0 z-50 bg-black/80 flex flex-col items-center justify-center cursor-pointer hover:bg-black/70 transition">
-                    <PlayCircle size={64} className="text-brand-500 mb-4 animate-pulse" />
-                    <h3 className="text-white font-bold text-xl">Clique para Iniciar</h3>
-                    <p className="text-gray-400 text-sm mt-2">Ativar Áudio & Preview</p>
-                </div>
-            )}
-
-            {/* OVERLAY: LOADING */}
+        {/* PREVIEW */}
+        <div className="relative shrink-0 w-[320px] h-[640px] bg-black rounded-3xl overflow-hidden border-4 border-gray-800 shadow-2xl">
             {!isReady && (
-                <div className="absolute inset-0 z-40 bg-gray-900 flex flex-col items-center justify-center text-center p-4">
-                    <Loader2 className="animate-spin text-brand-500 mb-4" size={32} />
-                    <p className="text-gray-400 text-sm animate-pulse">{loadingStatus}</p>
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 z-20">
+                    <Loader2 className="animate-spin text-brand-500 mb-2"/>
+                    <p className="text-gray-400 text-sm">{loadingStatus}</p>
+                </div>
+            )}
+            
+            {isReady && !hasUserInteracted && (
+                <div onClick={handleInteract} className="absolute inset-0 z-30 bg-black/70 flex flex-col items-center justify-center cursor-pointer hover:bg-black/60 transition">
+                    <PlayCircle size={64} className="text-brand-500 animate-pulse"/>
+                    <p className="text-white font-bold mt-2">Toque para Iniciar</p>
                 </div>
             )}
 
-            {/* CANVAS */}
-            <canvas ref={canvasRef} width={540} height={960} className="w-full h-full object-cover" />
+            <canvas ref={canvasRef} width={540} height={960} className="w-full h-full object-cover"/>
         </div>
 
         {/* CONTROLS */}
         <div className="flex-1 w-full space-y-6">
-            <div className="bg-gray-800/50 border border-gray-700 rounded-2xl p-6 backdrop-blur-xl">
-                <h3 className="text-2xl font-bold text-white mb-2">{script.title.replace(/[-_]/g, ' ')}</h3>
+            <div className="bg-gray-800 p-8 rounded-2xl border border-gray-700">
+                <h3 className="text-2xl font-bold text-white mb-2">{script.title}</h3>
+                <p className="text-gray-400 text-sm mb-6">Preview em baixa resolução. O download gera vídeo HD.</p>
                 
-                {!hasUserInteracted && isReady && (
-                    <div className="mb-4 bg-yellow-900/30 border border-yellow-600/50 p-3 rounded-lg flex items-center gap-2 text-yellow-200 text-sm">
-                        <AlertTriangle size={16}/> Clique na tela do celular ao lado para desbloquear o áudio.
-                    </div>
-                )}
-
                 <div className="flex gap-4 mb-6">
-                    <button 
-                        onClick={() => startPlayback(false)} 
-                        disabled={!isReady || isProcessing || !hasUserInteracted} 
-                        className="flex-1 bg-brand-600 hover:bg-brand-500 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                        {isPlaying && !isProcessing ? <Pause size={20}/> : <Play size={20}/>}
-                        {isPlaying && !isProcessing ? "Pausar" : "Tocar Preview"}
-                    </button>
-                    <button onClick={() => setIsMuted(!isMuted)} className="p-3 bg-gray-700 rounded-xl hover:bg-gray-600">
-                        {isMuted ? <VolumeX/> : <Volume2/>}
-                    </button>
+                     <button onClick={startPlayback} disabled={!hasUserInteracted} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-2">
+                        {isPlaying ? <Pause/> : <Play/>} Preview Rápido
+                     </button>
                 </div>
 
                 <button 
-                    onClick={handleDownload} 
-                    disabled={!isReady || isProcessing || !hasUserInteracted} 
-                    className="w-full bg-white text-black py-4 rounded-xl font-black text-lg flex items-center justify-center gap-3 hover:bg-gray-200 transition shadow-lg disabled:opacity-50"
+                    onClick={handleServerRender} 
+                    disabled={isProcessing || !isReady} 
+                    className="w-full bg-brand-600 hover:bg-brand-500 text-white py-5 rounded-xl font-black text-xl flex items-center justify-center gap-3 shadow-lg disabled:opacity-50 transition transform hover:scale-[1.02]"
                 >
-                    {isProcessing ? <Loader2 className="animate-spin text-red-600"/> : <Download className="text-brand-600"/>}
-                    {isProcessing ? "Gravando (Não feche)..." : "Baixar Vídeo (Com Áudio)"}
+                    {isProcessing ? <Loader2 className="animate-spin"/> : <CloudLightning/>}
+                    {isProcessing ? "Gerando MP4 no Servidor..." : "BAIXAR VÍDEO FINAL (HD)"}
                 </button>
+                
+                {finalVideoUrl && (
+                    <div className="mt-6 p-4 bg-green-900/30 border border-green-500 rounded-xl text-center animate-in slide-in-from-top-2">
+                        <p className="text-green-400 font-bold mb-2 flex items-center justify-center gap-2"><Download size={18}/> Vídeo Pronto!</p>
+                        <a href={finalVideoUrl} download className="text-white font-bold underline">Clique aqui para baixar novamente</a>
+                    </div>
+                )}
             </div>
             
-            <button onClick={onEditRequest} className="w-full text-center text-gray-400 hover:text-white text-sm flex items-center justify-center gap-2">
-                <RefreshCw size={14}/> Criar Novo Vídeo
+             <button onClick={onEditRequest} disabled={isProcessing} className="w-full text-center text-gray-500 hover:text-white text-sm">
+                Voltar para Edição
             </button>
         </div>
     </div>
